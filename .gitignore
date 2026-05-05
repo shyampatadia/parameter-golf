@@ -25,3 +25,5 @@ findings.txt
 *.fdb_latexmk
 *.fls
 *.log
+
+!report/presentation_script.md

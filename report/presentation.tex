@@ -174,8 +174,9 @@ Every 0.01\bpb is a real, measurable quality difference.
 
 % --------------------------------------------------------------- 5
 \begin{frame}{Lever \#1: precision -- the highest-leverage knob}
-\textbf{Intuition:} at 16~MB, INT8 fits $\sim$8M params, INT6 fits $\sim$11M.\\
-Lower precision $=$ more capacity. \emph{Should} be a free win.
+\textbf{Quantization:} store each weight in fewer bits (INT8 = 8-bit integers, INT6 = 6-bit). \\
+\textbf{Intuition:} at 16~MB, INT8 fits $\sim$8M params, INT6 fits $\sim$11M.
+\emph{Should} be a free win.
 
 \vspace{0.5em}
 \begin{columns}[T,onlytextwidth]
@@ -192,9 +193,9 @@ Lower precision $=$ more capacity. \emph{Should} be a free win.
 \end{itemize}
 
 \vspace{0.4em}
-\textcolor{accent}{\textbf{Surprise.}} Quantization-aware training matches the
-loss \emph{in memory}, but uniform 6-bit scales can't represent the trained
-weights. \\[0.4em]
+\textcolor{accent}{\textbf{Surprise.}} \emph{QAT} (quantization-aware training:
+simulate the rounding during training) matches the loss in memory, but uniform
+6-bit bins can't represent the trained weights at this scale.\\[0.4em]
 
 \hil{Lesson: more bits to spend $\neq$ more capacity if you can't read them back.}
 \end{columns}
@@ -206,21 +207,25 @@ weights. \\[0.4em]
 \column{0.5\textwidth}
 \centering
 \includegraphics[width=\linewidth]{curves_o2_posenc.pdf}\\
-{\scriptsize \textbf{Position:} Partial RoPE \good{1.215} -- best in-budget.\\
-The \emph{form} of the prior is second-order; \emph{having} one is first-order.}
+{\scriptsize \textbf{Position:} how the model knows token order. RoPE rotates
+each query/key by an angle that depends on its position; \emph{partial} RoPE
+applies it to only the first 32 of 64 head dimensions.\\
+Partial RoPE \good{1.215\bpb} -- best in-budget.}
 
 \column{0.5\textwidth}
 \centering
 \includegraphics[width=\linewidth]{curves_o3_optim.pdf}\\
-{\scriptsize \textbf{Optimizer:} Muon \good{1.217} $\ll$ AdamW (1.44), Adafactor (1.49). \\
-\emph{Load-bearing -- not a tunable.}}
+{\scriptsize \textbf{Optimizer:} Muon orthogonalizes the gradient of each
+weight matrix before stepping (Newton--Schulz iteration). \\
+Muon \good{1.217\bpb} $\ll$ AdamW (1.44), Adafactor (1.49). \emph{Load-bearing.}}
 \end{columns}
 
-\vspace{0.4em}
-\hrule
 \vspace{0.3em}
-\textbf{What about clever weight factorizations?} (low-rank, block-diagonal, random projection)\\
-$\rightarrow$ all land at \bad{1.30--1.40\bpb}. \hil{Falsified} as a capacity lever at this scale.
+\hrule
+\vspace{0.2em}
+{\small \textbf{Weight factorizations} (low-rank $W{=}UV^\top$, block-diagonal,
+fixed random projection): force structure on the weights to save parameters. \\
+$\rightarrow$ all land at \bad{1.30--1.40\bpb}. \hil{Falsified} as a capacity lever at this scale.}
 
 \end{frame}
 
@@ -269,17 +274,20 @@ Two follow-ups, each isolating \emph{one} side of the trade:
 
 \column{0.45\textwidth}
 \textbf{(a) Same arch, swap quantizer:}\\
-TurboQuant-INT4 (random rotation $+$ Lloyd--Max).\\
+\footnotesize TurboQuant: rotate each weight row by a random orthogonal
+matrix, then quantize with a Lloyd--Max codebook tuned for the resulting
+distribution. Originally an \emph{inference-time} KV-cache method
+(Zandieh~2024); we apply it to weights at 4 bits.\\
 $\rightarrow$ \bad{3.60\bpb} final. Catastrophic.
 
-\vspace{0.6em}
-\textbf{(b) Same quantizer, ease arch:}\\
+\vspace{0.5em}
+\normalsize\textbf{(b) Same quantizer, ease arch:}\\
 INT8 $+$ 11~layers $+$ MLP$=$2.\\
 $\rightarrow$ \good{1.194\bpb}, $-$0.030 below reference.
 
-\vspace{0.7em}
+\vspace{0.6em}
 \hil{Verdict: the quantizer was paying the bill.}\\
-The architecture lever works -- as long as you don't crush precision to fund it.
+{\footnotesize The architecture lever works -- as long as you don't crush precision to fund it.}
 \end{columns}
 \end{frame}
 
@@ -289,22 +297,26 @@ The architecture lever works -- as long as you don't crush precision to fund it.
 \begin{columns}[T,onlytextwidth]
 \column{0.5\textwidth}
 \textbf{O6 -- Multi-Query Attention.}\\
-1 KV head $\rightarrow$ free parameters $\rightarrow$ 12 layers fit.\\
-\good{1.198\bpb} at 19.56~MB.\\[0.3em]
+{\scriptsize Share \emph{one} K/V projection across all heads instead of one per
+head. Frees parameters that fund a 12-layer model.}\\
+\good{1.198\bpb} at 19.56~MB.\\[0.2em]
 \centering\includegraphics[width=0.95\linewidth]{curves_o6_mqa.pdf}
 
 \column{0.48\textwidth}
 \textbf{O7 -- QK-gain initialization.}\\
+{\scriptsize Per-head learnable scalar on the query projection.}\\
 $g_q^{(0)} \in \{1.5, 3.0, 5.0\}$. Spread \alert{0.002\bpb}. \\
-\hil{Null effect.} Learned $g_q$ converges regardless.\\[0.6em]
+\hil{Null effect.} Learned $g_q$ converges regardless.\\[0.4em]
 
 \textbf{O8 -- LR / warmup sweep ($3{\times}3$).}\\
 Spread \alert{0.0019\bpb}. \\
-\hil{Null effect.} Default recipe is at the optimum.\\[0.6em]
+\hil{Null effect.} Default recipe is at the optimum.\\[0.4em]
 
 \textbf{O9 -- Eval protocol.}\\
-Same weights; sliding-window stride-256 scores \hil{1.160\bpb}.\\
-\textit{Apples-to-apples comparison requires non-overlapping windows.}
+{\scriptsize Sliding-window eval: instead of scoring non-overlapping
+1024-token chunks, slide the window 256 tokens at a time so every token sees
+more left-context.}\\
+Same weights $\rightarrow$ \hil{1.160\bpb}. \textit{Not leaderboard-comparable, but a fair upper bound.}
 \end{columns}
 
 \vspace{0.5em}
@@ -318,10 +330,12 @@ Same weights; sliding-window stride-256 scores \hil{1.160\bpb}.\\
 % --------------------------------------------------------------- 10
 \begin{frame}{The headline: 16~MB is an \emph{elbow}, not a wall}
 \centering
-\includegraphics[width=0.92\linewidth]{pareto_frontier.pdf}
+\includegraphics[width=0.85\linewidth]{pareto_frontier.pdf}
 
-\vspace{-0.3em}
-{\small Below 15.9~MB: every MB saved costs $\sim$0.02\bpb (steep).\\
+\vspace{-0.2em}
+{\scriptsize \textbf{Pareto frontier} = the lower-left envelope: each point on it is the best bpb
+\emph{achievable} at that size.}\\[0.2em]
+{\small Below 15.9~MB: every MB saved costs $\sim$0.02\bpb (steep).
 Above 15.9~MB: marginal gains flatten. \\
 \good{In-budget winner 1.215\bpb at 15.87~MB} \;\;|\;\; \good{over-budget winner 1.194\bpb at 19.30~MB}.}
 \end{frame}
