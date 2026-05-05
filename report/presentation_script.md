@@ -1,139 +1,179 @@
 # Presentation script — Parameter Golf
-**Total target: ~8 minutes.** Speak at a measured pace; the timings below assume ~145 words/min.
+**Total target: ~8 minutes** at a measured pace (~135 words/min).
+
+The structure is built around three questions that the project answers, plus a clearly stated goal up front.
 
 ---
 
 ## Slide 1 — Title  *(~15 s)*
 
-Hi everyone, I'm Shyam. Today I'll walk you through a controlled study I ran for the OpenAI Parameter Golf challenge — basically, how do you compress a working language model down to 16 megabytes, and which compression levers actually matter?
+Hi everyone, I'm Shyam. The project I'll walk you through today asks a simple question: how small can a language model get and still be useful?
 
 ---
 
-## Slide 2 — "Can a language model fit in 16 MB?"  *(~40 s)*
+## Slide 2 — The goal  *(~50 s)*
 
-To set the stakes: 16 megabytes is smaller than a single MP3 song. It's smaller than most PowerPoint decks. And it's about a thousand times smaller than GPT-2 — a model that's already considered ancient by today's standards.
+The goal of this project is straightforward: train a useful language model that fits in 16 megabytes. That's the constraint OpenAI sets in their *Parameter Golf* challenge.
 
-OpenAI set this exact constraint as their *Parameter Golf* challenge: train a model entirely from scratch, ship the weights and the training code together in under sixteen million bytes, and then we score how well it predicts unseen English text. The challenge gives us a reference baseline to beat — 1.2244 bpb. I'll explain what that number means in just a second.
+To put 16 megabytes in perspective — that's smaller than a single MP3 song, smaller than most PowerPoint decks, and about a thousand times smaller than GPT-2.
 
----
+The reason this is an interesting problem: when capacity is this scarce, every megabyte you save on one component has to be earned somewhere else, so the constraint tests which design decisions actually matter. And on the practical side, a working model at this size is small enough to ship inside an app or run on-device.
 
-## Slide 3 — "What does *score* mean? bits per byte"  *(~50 s)*
-
-So bpb stands for bits-per-byte, and the intuition is really simple: it's how many bits the model needs to *guess each byte* of unseen text. It's literally the same idea as a compression ratio — a good model compresses text by spending fewer bits on each correct prediction; a bad model wastes bits on wrong guesses.
-
-The scale on the right makes this concrete. If you guess randomly over all 256 byte values, that's 8 bpb — you're wasting all 8 bits. If you only know letter frequencies — that "e" is more common than "z" — you get down to about 4.5. The challenge baseline is at 1.22. Frontier models like GPT-4 are around 1.0. And a perfect oracle — a model that always knows what comes next — is at zero.
-
-So **lower is better**, and every hundredth of a bpb is a real, measurable quality difference.
+The number we're trying to beat — the published baseline for this challenge — is 1.2244 bpb. I'll explain what bpb means in just a second.
 
 ---
 
-## Slide 4 — "How does a model become a 16 MB artifact?"  *(~40 s)*
+## Slide 3 — bpb intuition  *(~50 s)*
 
-Here's the pipeline. We train in bfloat16 for 20,000 steps. Then we *quantize* — that just means storing each weight in fewer bits — INT8 or INT6 or INT4. Then we run zlib lossless compression on the quantized weights. That gives us our artifact. We measure that against 16 megabytes. Then we round-trip it: decompress, dequantize, rehydrate the model, and score it.
+So bpb is bits-per-byte. It's how many bits the model spends to *guess each byte* of unseen text. It's the same idea as a compression ratio — a good model spends fewer bits on correct guesses; a bad model wastes bits on wrong ones.
 
-Inside this pipeline there are three big levers we can push: the **architecture** itself — depth, width, attention design; the **quantizer** — the precision we squeeze the weights into; and the **recipe** — the optimizer and the schedule. Now, lots of efficient-LM papers change all three at once, which makes the attribution unclear. So my method here is to vary one lever at a time — 47 of 48 knobs held fixed — and run 46 controlled experiments at 20,000 steps each.
+The scale on the right anchors this. If you guess randomly over all 256 possible byte values, that's 8 bpb — you're using all 8 bits and getting no benefit from a model. If you only know which letters are common in English, you get to about 4.5. The challenge baseline is at 1.22. Frontier models like GPT-4 are around 1.0. A perfect oracle is at zero.
 
----
-
-## Slide 5 — "Lever #1: precision"  *(~55 s)*
-
-The first lever — and intuitively the highest-leverage one — is precision.
-
-The reason is simple math. At 16 megabytes, INT8 buys you about 8 million parameters. INT6 buys you 11 million. So lower precision *should* be a free win — you just get more model capacity. Right?
-
-I tested INT8 versus INT6 head-to-head, with QAT — quantization-aware training, which means we *simulate* the rounding to 6 bits during training, so the model has a chance to adapt.
-
-And here's the surprise. Look at the curves on the left — during training, INT6 and INT8 reach exactly the same loss in memory. The QAT does its job. But after we round-trip — actually quantize, compress, decompress — INT8 holds at 1.216 bpb. INT6 collapses to 1.349.
-
-The lesson is sharp: more bits to *spend* doesn't mean more capacity if you can't actually *read them back*. The 6-bit bins just can't represent the trained weight distribution at this scale.
+So lower is better, and every hundredth of a bpb is a measurable difference in quality.
 
 ---
 
-## Slide 6 — "Levers 2, 3, and 4"  *(~50 s)*
+## Slide 4 — What is this model, and what does it do?  *(~45 s)*
 
-Three more levers, briefly.
+Before we get into compression, let me say what this model actually *is*. It's a decoder-only Transformer — the same architectural family as GPT. It has one capability: read a sequence of tokens, and output a probability distribution over the next token.
 
-**Position encoding** — how the model knows token order. RoPE rotates each query and key vector by an angle that depends on its position. *Partial* RoPE applies that rotation to only part of each head's dimensions. It wins at 1.215 bpb. The interesting finding here: the *form* of the position prior is second-order — what really matters is *having* one at all. No-PE is the only condition that does badly.
+That single capability is enough. Generation is just sampling from that distribution, appending the new token to the input, and repeating — that's the loop every modern language model uses to produce text.
 
-**Optimizer** — Muon orthogonalizes each weight matrix's gradient before stepping, using a Newton–Schulz iteration. It beats AdamW by more than 0.2 bpb at this scale. So Muon isn't just a tunable here — it's load-bearing.
+The diagram on the right makes it concrete: feed it the prefix "The quick brown", and the model returns a probability for every possible next token — fox at 62 percent, dog at 8, and so on.
 
-**Weight factorizations** — low-rank, block-diagonal, fixed random projection. The idea is to force structure on the weights to save parameters. All three land between 1.30 and 1.40 — clearly worse than just using dense matrices. So this whole region of the design space is *falsified* as a capacity lever at our scale.
+We train this model from scratch on FineWeb — a 10-billion-token English shard that HuggingFace released — using a 1,024-piece SentencePiece tokenizer. No pretrained weights, no transfer learning. Every result is from a model trained entirely from random initialization.
 
 ---
 
-## Slide 7 — "Now stack the winners"  *(~40 s)*
+## Slide 5 — How a model becomes a 16 MB artifact  *(~50 s)*
 
-The natural next step: combine everything that works. Partial RoPE *plus* INT6 to fund extra capacity *plus* 11 layers *plus* a wider MLP.
+Now, how do we get from a trained model to a 16 megabyte artifact?
 
-And it produces the most informative run of the whole study — for completely the wrong reason. Training-time loss drops to 1.16 — the best we ever saw. But the *final* round-trip loss goes *up* to 1.28 — worse than the simple baseline.
+This is the pipeline. We train in bfloat16 for 20,000 steps. We *quantize* the weights — store each one in fewer bits. We compress the result with zlib. That's our artifact, and we measure it against the 16 megabyte limit.
+
+I want to pause on the last box — "round-trip" — because the word can be confusing. Round-trip here has nothing to do with the dataset. It means: compress the artifact, decompress it, dequantize the weights, then re-evaluate. We always score the model the *user* would receive — not the bf16 model sitting in GPU memory at the end of training. That distinction matters.
+
+So the question this project asks is: out of all the things we can change in this pipeline — the architecture, the quantizer, the training recipe — which ones actually move the needle? I tested each decision one at a time. Forty-six runs at twenty thousand steps each.
+
+---
+
+## Slide 6 — Question 1: how aggressively can we shrink the weights?  *(~55 s)*
+
+The first question, and the one with the highest leverage, is precision.
+
+Here's the math. At 16 megabytes, INT8 — eight-bit weights — buys you about 8 million parameters. INT6 buys you about 11 million. So lower precision *should* be a free win — more capacity for the same budget.
+
+I tested INT8 and INT6 head-to-head, with quantization-aware training. That means we *simulate* the rounding to 6 bits during training, so the model has a chance to adapt.
+
+Look at the curves on the left. During training, the two converge to the *same* loss. The QAT does its job — in memory, INT6 is just as good as INT8.
+
+But after we round-trip through zlib, INT8 holds at 1.216 bpb, and INT6 falls to 1.349. The 6-bit bins can't represent the trained weight distribution at this scale, and QAT doesn't recover the gap.
+
+So the takeaway is: more bits to *spend* doesn't mean more capacity if you can't read them back.
+
+---
+
+## Slide 7 — Question 2: does the rest of the design matter?  *(~55 s)*
+
+Three more decisions, one at a time.
+
+First, position encoding — how the model knows the order of tokens. I tested four schemes. Partial RoPE wins at 1.215 bpb, but the gap between any two *position-aware* schemes is small. The only thing that hurts is removing position information entirely. So having a position prior is first-order; the form of it is second-order.
+
+Second, the optimizer. Muon, which orthogonalizes each weight matrix's gradient before stepping, beats AdamW by more than 0.2 bpb at this scale. The optimizer is load-bearing here, not a free knob.
+
+Third, weight factorizations — low-rank, block-diagonal, fixed random projection. These force structure on the weights to save parameters. All three land between 1.30 and 1.40 — worse than just using dense matrices. So at our scale, structured weights don't compete with dense ones.
+
+---
+
+## Slide 8 — Question 3: can we just stack the winners?  *(~45 s)*
+
+The natural next move: combine everything that worked. Take the best position encoding, switch to INT6 to fund extra capacity, push to 11 layers and a wider MLP.
+
+What we get is informative — but for the wrong reason.
+
+Training-time loss drops to 1.16 — the lowest training loss in the study. But the *final* round-trip loss goes *up* to 1.28 — worse than the simple baseline.
 
 So the capacity expansion is real — minus 0.06 in training. But the INT6 quantizer is taxing us 0.12 on the round-trip. The two effects almost exactly cancel.
 
-Which leaves the question: which lever is paying the bill? Is it the capacity, or is it the quantizer?
+This raises the question: which lever is responsible — the capacity, or the quantizer?
 
 ---
 
-## Slide 8 — "The decisive experiment"  *(~55 s)*
+## Slide 9 — The answer  *(~55 s)*
 
 To answer that, two follow-ups, each isolating one side of the trade.
 
-**(a) Hold the architecture fixed, swap the quantizer.** I tried TurboQuant-INT4. TurboQuant is a clever idea — rotate each weight row by a random orthogonal matrix, which makes the values fall on a known statistical distribution, then quantize with a codebook tuned to that distribution. Important context: TurboQuant was originally designed for the *KV-cache* — that's an inference-time activation cache, not the weights. We're applying the same machinery to weights at 4 bits, which is outside the regime it was validated on. And in fact it fails catastrophically — 3.6 bpb final. So that lever is a dead end.
+First — hold the architecture fixed, and swap the quantizer. I tried TurboQuant at 4 bits. TurboQuant is a method that rotates each weight row by a random orthogonal matrix, which makes the values fall on a known statistical distribution, then quantizes with a codebook tuned to that distribution. One important caveat: TurboQuant was originally designed for the *KV-cache* — that's an inference-time activation cache, *not* the weights. We're applying the same machinery to weights at 4 bits, which is outside what it was validated on. The result is 3.6 bpb final — the quantizer fails far below 8 bits, so this lever is a dead end.
 
-**(b) Hold the quantizer fixed at known-safe INT8, ease the architecture.** Just go from 9 layers to 11, MLP at 2 instead of 3. That lands at 1.194 bpb — 0.030 below the reference, at 19.3 megabytes.
+Second — hold the quantizer fixed at INT8, and ease the architecture. Go from 9 layers to 11, MLP at 2 instead of 3. That lands at 1.194 bpb — 0.030 below the reference, at 19.3 megabytes.
 
-So the verdict is clean: **the quantizer was paying the bill**. The architecture lever genuinely works — as long as you don't crush precision to fund it.
-
----
-
-## Slide 9 — "Three more levers"  *(~50 s)*
-
-Three more axes I added beyond the proposal.
-
-**Multi-Query Attention** shares a single K and V projection across all attention heads instead of one set per head. The freed parameters fund a 12-layer model. That hits 1.198 bpb.
-
-**QK-gain initialization** — a learnable scalar on the query projection. I tried three init values; the spread was 0.002 bpb. Null effect — the parameter just learns its way to the same place regardless of where you start it.
-
-**Learning-rate and warmup sweep**, three by three. Spread 0.0019. Also a null. The default recipe was already at the optimum.
-
-**Eval protocol** — instead of scoring non-overlapping 1024-token chunks, slide the window 256 tokens at a time, so every token sees more left-context. Same weights, but the score drops to 1.160. That's not leaderboard-comparable — but it's a fair upper bound on what the model actually knows.
-
-I want to note: three of these are nulls, and I'm reporting them as findings — because negative results constrain the design space and save future work.
+So the result is clear: the quantizer was the binding constraint. The architecture lever works — as long as you don't crush precision to fund it.
 
 ---
 
-## Slide 10 — "The headline: a Pareto frontier"  *(~45 s)*
+## Slide 10 — What else we tried  *(~45 s)*
 
-When you put every run on a single size-versus-quality plane, you get this picture. The Pareto frontier is the lower-left envelope — each point on it is the best bpb you can achieve at that size.
+Four more axes, more briefly.
 
-And the result has a really clean shape: there's a sharp elbow right around 15.9 megabytes. Below that, every megabyte you save costs you about 0.02 bpb — steep tradeoff. Above it, the curve flattens out — you have to spend more and more megabytes to buy each additional bit of quality.
+Multi-Query Attention shares a single K/V projection across all attention heads instead of one per head. The freed parameters fund a 12-layer model. That reaches 1.198 bpb.
 
-So the framing I want to push back against is the binary one. The 16-megabyte mark isn't a wall. It's a soft elbow on a smooth curve. The in-budget winner is at 1.215 bpb. Spend an extra 3.3 megabytes and you get to 1.194. That's a real, measurable trade — not a constraint violation.
+QK-gain initialization — a learnable scalar on the query projection. I tried three init values; the spread was 0.002 — null effect.
+
+Learning-rate and warmup sweep, three by three. Spread 0.0019 — also null. The default recipe is already at the optimum.
+
+Eval protocol — instead of scoring non-overlapping context windows, slide the window 256 tokens at a time so every token sees more left-context. Same weights score 1.160 bpb. But this is not leaderboard-comparable — the official protocol uses non-overlapping windows — so I'm reporting it as an upper bound, not as our score.
+
+Three of those are null effects, and I'm reporting them as findings. Negative results constrain the design space.
 
 ---
 
-## Slide 11 — "Are these numbers real, or seed luck?"  *(~25 s)*
+## Slide 11 — The full size-quality picture  *(~40 s)*
 
-Quick sanity check. I re-ran the three surviving in-budget axes at three different random seeds. The standard deviations are around one or two thousandths of a bpb. The per-axis effects we care about are 0.05 to 0.20 bpb — ten to a hundred times the seed noise. So the single-seed claims hold up.
+When you put every run on a single size-versus-quality plane, you get this Pareto frontier — the lower-left envelope of what's achievable at each size.
+
+There's an elbow right around 15.9 megabytes. Below that elbow, every megabyte you save costs you about 0.02 bpb. Above it, the curve flattens out.
+
+The takeaway: 16 megabytes isn't a hard wall — it's an elbow on a continuous curve. The in-budget winner is at 1.215 bpb. Spend an extra 3.3 megabytes and you reach 1.194. It's a continuous trade, not a binary.
 
 ---
 
-## Slide 12 — "What we learned"  *(~50 s)*
+## Slide 12 — Are these numbers real?  *(~25 s)*
+
+A sanity check. I re-ran the three surviving in-budget axes at three different random seeds. The standard deviations come in around one or two thousandths of a bpb. The per-axis effects we care about are 0.05 to 0.20 — ten to a hundred times the seed noise. The findings hold up.
+
+---
+
+## Slide 13 — What we learned  *(~50 s)*
 
 Five takeaways.
 
-One — sub-INT8 weight quantization is fragile at this scale. Neither QAT nor random rotation saves it. The quantizer, not the recipe, is the binding constraint.
+One — the quantizer is the binding constraint. Below 8 bits, weight quantization breaks at this scale, and the fixes I tried don't recover it.
 
-Two — capacity expansion is real, but only INT8 carries it. The exact same architectural change forfeits its gain under INT6 and lands 0.030 below reference under INT8.
+Two — architecture matters, but only if the quantizer can carry it. The same 11-layer model fails under INT6 and wins under INT8.
 
-Three — inductive biases matter at the margin, not the headline. RoPE, MQA, depth — each is worth a hundredth or two of a bpb. None of them rivals the precision lever in effect size.
+Three — inductive biases like RoPE, MQA, and depth matter at the margin. Each is worth a hundredth or two of a bpb — real but small.
 
-Four — 16 megabytes is a soft elbow on a smooth Pareto curve. It's not a hard cutoff to architect around.
+Four — 16 megabytes is an elbow on the curve, not a hard cutoff. Spending 3.3 megabytes more buys 0.020 bpb — a continuous trade.
 
-Five — three nulls reported as findings. Weight factorizations, QK-gain init, LR-warmup. Each one rules out a region of the design space.
+Five — three nulls are findings too. Weight factorizations, QK-gain init, learning-rate sweeps. Saying *no* rules out a region of the design space, and that's as useful as a positive result.
 
 ---
 
-## Slide 13 — Thanks  *(~15 s)*
+## Slide 14 — Where we started, where we ended  *(~40 s)*
+
+To close, the bigger picture — the journey from start to finish.
+
+We started with one number: the published 1.2244 baseline at 15.85 megabytes. One configuration, no insight into which of its choices were earning the score.
+
+We ended with two competitive models: an in-budget winner at 1.215 bpb at 15.87 megabytes, and an over-budget winner at 1.194 bpb at 19.30 megabytes — 0.030 bpb below the published reference.
+
+We also mapped the entire size-quality curve from 7 megabytes up to 19, and we know which compression decisions earn the gains and which ones don't.
+
+And the model is runnable code. The smoke test in `experiments/demo/` loads a trained checkpoint, runs a forward pass on a prompt, and prints the top-k next-token predictions — confirming the artifact works as a language model.
+
+---
+
+## Slide 15 — Thanks  *(~10 s)*
 
 Thank you. The full report and code are on the GitHub link. Happy to take questions.
 
@@ -141,7 +181,12 @@ Thank you. The full report and code are on the GitHub link. Happy to take questi
 
 ### Pacing notes
 
-- **Total spoken: ~1150 words ≈ 7 min 55 s** at 145 wpm.
-- The two longest sections (slides 5 and 8) are where the *story turns* — slow down on those, especially "the surprise" on slide 5 and "the verdict" on slide 8.
-- Slide 11 (multi-seed) is a deliberate quick beat — ~25 seconds — to give you breathing room before the takeaways.
-- If you're running long, the cuttable pieces are: the parenthetical on weight factorizations (slide 6), and the QK-gain detail (slide 9). Each saves ~10 s.
+- **Total: ~8 min** at 135 wpm.
+- **Structure:**
+  1. **Set up** — goal (slide 2), metric (3), the model (4), pipeline + the question (5).
+  2. **Three questions** — precision (6), other design choices (7), stacking the winners (8).
+  3. **Resolution** — the A/B that identifies the bottleneck (9).
+  4. **Filling in** — other axes (10), Pareto (11), seed check (12).
+  5. **Close** — takeaways (13), start → end + demo (14).
+- **Slides to slow down on:** slide 6 (the INT6 round-trip result), slide 8 (the question that drives slide 9), slide 9 (the conclusion that the quantizer is the binding constraint).
+- **Cuttable if running long:** the QK-gain bullet on slide 10 (~10 s), or the entire seed-check slide 12 (~25 s).

@@ -45,7 +45,7 @@
 % Title
 % =====================================================================
 \title{Architecture and Training Design \\ Under a Hard Parameter Budget}
-\subtitle{A Controlled Ablation Study at 16~MB}
+\subtitle{Building the Best 16~MB Language Model}
 \author{Shyam Patadia \\ \texttt{spatadia@wpi.edu}}
 \institute{Worcester Polytechnic Institute \\ CS586: Big Data Analytics}
 \date{Spring 2026 \\[0.4em] \footnotesize \href{https://github.com/shyampatadia/parameter-golf}{github.com/shyampatadia/parameter-golf}}
@@ -56,44 +56,47 @@
 \maketitle
 
 % =====================================================================
-% ACT I — THE QUESTION
+% PART I — THE GOAL
 % =====================================================================
 
 % --------------------------------------------------------------- 2
-\begin{frame}{Can a language model fit in 16~MB?}
+\begin{frame}{The goal}
 \centering
+\vspace{0.3em}
 \Large
-That's smaller than \emph{a single MP3 song}.\\[0.4em]
-Smaller than a typical PowerPoint deck.\\[0.4em]
-\hil{1{,}000$\times$ smaller than GPT-2.}\\[1.2em]
+\textbf{Train a useful language model that fits in 16~MB.}\\[1.0em]
 
 \normalsize
-OpenAI's \emph{Parameter Golf} challenge sets exactly this constraint:
+\hil{1{,}000$\times$ smaller than GPT-2.}\\
+Smaller than an MP3 song.\\[1.4em]
+
+Why this is interesting:
 \begin{itemize}
-    \item Train a model from scratch.
-    \item Ship weights $+$ training code in $\leq$ \hil{16{,}000{,}000~bytes}.
-    \item Score: how well it predicts unseen English text.
+  \item Tests which design decisions actually matter when capacity is scarce.
+  \item Every megabyte saved on one component has to be earned somewhere else.
+  \item A working model at this size is small enough to ship inside an app
+        or run on-device.
 \end{itemize}
 
-\vspace{0.6em}
-\textbf{Reference to beat:} \hil{1.2244\bpb} (the challenge's published INT8 baseline).
+\vspace{0.8em}
+\textbf{The reference to beat:} \hil{1.2244\bpb} (the published INT8 baseline).
 \end{frame}
 
 % --------------------------------------------------------------- 3
-\begin{frame}{First, what does ``score'' mean? -- bits per byte}
+\begin{frame}{What does ``score'' mean? -- bits per byte}
 \begin{columns}[T,onlytextwidth]
 \column{0.55\textwidth}
-\textbf{bpb} = how many \emph{bits} the model needs to \emph{guess each byte} of unseen text.\\[0.5em]
+\textbf{bpb} = how many \emph{bits} the model spends to \emph{guess each byte} of unseen text.\\[0.5em]
 
-It's the same as a compression ratio: a good model compresses text;
-a bad model wastes bits on wrong guesses.
+It's the same as a compression ratio: a good model spends fewer bits on
+correct guesses; a bad model wastes bits on wrong ones.
 
 \vspace{0.7em}
 \textbf{The scale:}
 \begin{itemize}\setlength{\itemsep}{2pt}
-  \item \bad{8.0\bpb} -- random guessing over all 256 byte values (no model)
-  \item \warn{$\sim$4.5\bpb} -- guess letter frequency only
-  \item \hil{1.2244\bpb} -- the challenge baseline
+  \item \bad{8.0\bpb} -- random guessing (no model)
+  \item \warn{$\sim$4.5\bpb} -- letter frequency only
+  \item \hil{1.2244\bpb} -- our reference baseline
   \item \good{$\sim$1.0\bpb} -- frontier large LMs (GPT-4 class)
   \item \textbf{0\bpb} -- a perfect oracle
 \end{itemize}
@@ -105,7 +108,6 @@ Every 0.01\bpb is a real, measurable quality difference.
 \column{0.45\textwidth}
 \centering
 \begin{tikzpicture}[scale=0.85, every node/.style={font=\scriptsize}]
-% Vertical scale bar
 \fill[primary!10] (0,0) rectangle (0.6, 8);
 \foreach \y/\lab in {0/0, 2/2, 4/4, 6/6, 8/8} {
   \draw (0,\y) -- (0.6,\y);
@@ -113,14 +115,12 @@ Every 0.01\bpb is a real, measurable quality difference.
 }
 \node[rotate=90, above] at (-1.2, 4) {\textbf{bpb} (lower = better)};
 
-% Annotations on the right
 \node[right, accent] at (0.7, 8.0)  {\bad{8.0} -- random};
 \node[right, warn]   at (0.7, 4.5)  {\warn{4.5} -- letter freq.};
 \node[right, primary, font=\scriptsize\bfseries] at (0.7, 1.2244) {\hil{1.22} -- baseline};
 \node[right, ok]     at (0.7, 1.0)  {\good{1.0} -- GPT-4 class};
 \node[right]         at (0.7, 0.0)  {\textbf{0} -- oracle};
 
-% Markers
 \fill[accent]  (0.3, 8.0)    circle (1.5pt);
 \fill[warn]    (0.3, 4.5)    circle (1.5pt);
 \fill[primary] (0.3, 1.2244) circle (2.5pt);
@@ -131,7 +131,50 @@ Every 0.01\bpb is a real, measurable quality difference.
 \end{frame}
 
 % --------------------------------------------------------------- 4
-\begin{frame}{How does a model become a 16~MB artifact?}
+\begin{frame}{What is this model, and what does it do?}
+\begin{columns}[T,onlytextwidth]
+\column{0.52\textwidth}
+\textbf{A decoder-only Transformer} -- same family as GPT.\\[0.4em]
+Its single capability:
+\begin{itemize}\setlength{\itemsep}{1pt}
+  \item \hil{Read a sequence of tokens.}
+  \item \hil{Output a probability distribution over the next token.}
+\end{itemize}
+\emph{Generation} = sample from the distribution, append the token, repeat
+-- the same loop used by every modern LM.
+
+\vspace{0.6em}
+\textbf{Trained from scratch on FineWeb} \\
+{\footnotesize (a 10B-token open-web English shard from HuggingFace).}\\
+\textbf{Tokenizer:} 1{,}024-piece SentencePiece BPE.\\
+\hil{No pretrained weights. No transfer learning.}
+
+\column{0.48\textwidth}
+\centering
+\begin{tikzpicture}[every node/.style={font=\scriptsize, align=center}]
+\node[draw=primary, very thick, rounded corners, fill=soft,
+      minimum width=5.0cm, minimum height=0.7cm] (in)
+      {\textbf{Input:} \texttt{"The quick brown"}};
+\node[below=0.35cm of in, draw=primary, very thick, rounded corners,
+      fill=primary!12, minimum width=5.0cm, minimum height=1.0cm] (m)
+      {\textbf{16~MB Transformer}\\ {\scriptsize 9 layers, $d{=}512$, 8 heads}};
+\node[below=0.35cm of m, draw=primary, thick, rounded corners,
+      minimum width=5.0cm, minimum height=1.85cm, align=left,
+      inner sep=4pt] (out)
+      {\textbf{Output:} probability over next token \\[0.2em]
+       \hspace*{0.5em}\texttt{fox}\hspace{0.5em}\good{0.62} \\
+       \hspace*{0.5em}\texttt{dog}\hspace{0.5em}0.08\\
+       \hspace*{0.5em}\texttt{cat}\hspace{0.5em}0.05\\
+       \hspace*{0.5em}\texttt{...}};
+
+\draw[-{Stealth[length=4pt]}, primary, thick] (in) -- (m);
+\draw[-{Stealth[length=4pt]}, primary, thick] (m) -- (out);
+\end{tikzpicture}
+\end{columns}
+\end{frame}
+
+% --------------------------------------------------------------- 5
+\begin{frame}{How a model becomes a 16~MB artifact}
 \centering
 \begin{tikzpicture}[
   every node/.style={font=\scriptsize, align=center},
@@ -144,7 +187,7 @@ Every 0.01\bpb is a real, measurable quality difference.
 \node[box, right=0.25cm of train] (quant) {\textbf{Quantize}\\ INT8 / INT6 / TQ4};
 \node[box, right=0.25cm of quant] (zlib)  {\texttt{zlib} \\ compress};
 \node[box, right=0.25cm of zlib]  (size)  {\hil{Artifact}\\ vs.\ 16~MB};
-\node[box, right=0.25cm of size]  (eval)  {Round-trip\\ $\rightarrow$ \hil{bpb}};
+\node[box, right=0.25cm of size]  (eval)  {\textbf{Round-trip}\\ $\rightarrow$ \hil{bpb}};
 
 \draw[arr] (train) -- (quant);
 \draw[arr] (quant) -- (zlib);
@@ -152,237 +195,280 @@ Every 0.01\bpb is a real, measurable quality difference.
 \draw[arr] (size)  -- (eval);
 \end{tikzpicture}
 
-\vspace{0.9em}
-\small This study has \hil{three levers} to push:
-\begin{columns}[T,onlytextwidth]
-\column{0.32\textwidth}\centering
-\textbf{Architecture}\\ {\scriptsize depth, width, attention}
-\column{0.32\textwidth}\centering
-\textbf{Quantizer}\\ {\scriptsize INT8, INT6, TurboQuant-INT4}
-\column{0.32\textwidth}\centering
-\textbf{Recipe}\\ {\scriptsize optimizer, schedule, init}
-\end{columns}
+\vspace{0.6em}
+\begin{tikzpicture}
+\node[draw=primary, very thick, rounded corners=3pt, fill=primary!8,
+      inner sep=5pt, text width=\linewidth-0.6em, font=\footnotesize] {%
+\textbf{What ``round-trip'' means here:} \emph{compress the artifact,
+decompress it, dequantize the weights, then re-evaluate.} We always
+score the model the user would actually receive -- not the bf16 model
+sitting in GPU memory at the end of training.};
+\end{tikzpicture}
 
-\vspace{0.7em}
-\small \textbf{Method:} \emph{vary one lever at a time} -- 47 of 48 knobs held fixed.\\
-\hil{46 controlled 20k-step runs} on FineWeb.
+\vspace{0.6em}
+\large
+\hil{Which of the things we can change here actually moves the needle?}\\[0.3em]
+\normalsize
+We tested each decision \emph{one at a time} -- 46 runs at 20{,}000 steps each.
 \end{frame}
 
 % =====================================================================
-% ACT II — PULLING THE LEVERS
+% PART II — THE THREE QUESTIONS
 % =====================================================================
 
 % --------------------------------------------------------------- 5
-\begin{frame}{Lever \#1: precision -- the highest-leverage knob}
-\textbf{Quantization:} store each weight in fewer bits (INT8 = 8-bit integers, INT6 = 6-bit). \\
-\textbf{Intuition:} at 16~MB, INT8 fits $\sim$8M params, INT6 fits $\sim$11M.
-\emph{Should} be a free win.
+\begin{frame}{Question 1: How aggressively can we shrink the weights?}
+{\small\textbf{Quantization} = store each weight in fewer bits.
+At 16~MB, INT8 fits $\sim$8M params, INT6 fits $\sim$11M.
+Lower precision \emph{should} be a free win.}
 
-\vspace{0.5em}
+\vspace{0.4em}
 \begin{columns}[T,onlytextwidth]
-\column{0.55\textwidth}
+\column{0.5\textwidth}
 \centering
 \includegraphics[width=\linewidth]{curves_o1_quant.pdf}
 
-\column{0.45\textwidth}
-\textbf{Training-time:} INT6 and INT8 reach the \emph{same} loss.\\[0.4em]
-\textbf{After zlib roundtrip:}
-\begin{itemize}
-  \item INT8: \good{1.216\bpb} ($\Delta_q = 0.008$)
-  \item INT6: \bad{1.349\bpb} ($\Delta_q = 0.141$)
+\column{0.5\textwidth}
+\small
+In training: INT6 and INT8 reach the \emph{same} loss.\\[0.4em]
+
+After round-trip through \texttt{zlib}:
+\begin{itemize}\setlength{\itemsep}{1pt}
+  \item INT8: \good{1.216\bpb}
+  \item INT6: \bad{1.349\bpb}
 \end{itemize}
 
-\vspace{0.4em}
-\textcolor{accent}{\textbf{Surprise.}} \emph{QAT} (quantization-aware training:
-simulate the rounding during training) matches the loss in memory, but uniform
-6-bit bins can't represent the trained weights at this scale.\\[0.4em]
+\vspace{0.3em}
+The 6-bit bins can't represent the trained weights, and QAT doesn't recover the gap.
 
-\hil{Lesson: more bits to spend $\neq$ more capacity if you can't read them back.}
+\vspace{0.3em}
+\hil{More bits to spend $\neq$ more capacity if you can't read them back.}
 \end{columns}
 \end{frame}
 
 % --------------------------------------------------------------- 6
-\begin{frame}{Levers \#2--4: position, optimizer, factorizations}
-\begin{columns}[T,onlytextwidth]
-\column{0.5\textwidth}
-\centering
-\includegraphics[width=\linewidth]{curves_o2_posenc.pdf}\\
-{\scriptsize \textbf{Position:} how the model knows token order. RoPE rotates
-each query/key by an angle that depends on its position; \emph{partial} RoPE
-applies it to only the first 32 of 64 head dimensions.\\
-Partial RoPE \good{1.215\bpb} -- best in-budget.}
-
-\column{0.5\textwidth}
-\centering
-\includegraphics[width=\linewidth]{curves_o3_optim.pdf}\\
-{\scriptsize \textbf{Optimizer:} Muon orthogonalizes the gradient of each
-weight matrix before stepping (Newton--Schulz iteration). \\
-Muon \good{1.217\bpb} $\ll$ AdamW (1.44), Adafactor (1.49). \emph{Load-bearing.}}
-\end{columns}
-
-\vspace{0.3em}
-\hrule
-\vspace{0.2em}
-{\small \textbf{Weight factorizations} (low-rank $W{=}UV^\top$, block-diagonal,
-fixed random projection): force structure on the weights to save parameters. \\
-$\rightarrow$ all land at \bad{1.30--1.40\bpb}. \hil{Falsified} as a capacity lever at this scale.}
-
-\end{frame}
-
-% =====================================================================
-% ACT III — THE PUZZLE AND THE RESOLUTION
-% =====================================================================
-
-% --------------------------------------------------------------- 7
-\begin{frame}{Now stack the winners -- and watch them \emph{cancel out}}
-\textbf{The natural next step:} combine everything that worked.\\
-Partial RoPE (best position) $+$ INT6 (most bits) $+$ 11 layers $+$ MLP$=$3.
+\begin{frame}{Question 2: Does the rest of the design matter?}
+\textbf{Three more decisions, one at a time:}
 
 \vspace{0.6em}
+\begin{itemize}\setlength{\itemsep}{6pt}
+  \item \textbf{Position encoding} -- how the model knows token order.\\
+        {\small Tested: full RoPE, partial RoPE, learned absolute, none.}\\
+        \good{Partial RoPE wins at 1.215\bpb} -- but the gap between any two
+        \emph{position-aware} schemes is tiny.\\
+        Lesson: \emph{having} positional info matters; the form is second-order.
+
+  \item \textbf{Optimizer} -- AdamW vs.\ Muon vs.\ Adafactor.\\
+        Muon (orthogonalized gradient steps) wins by \good{$>$0.2\bpb}. \\
+        Lesson: \emph{the optimizer is load-bearing, not a free knob.}
+
+  \item \textbf{Weight factorizations} -- low-rank, block-diagonal, random
+        projection. Force structure to save parameters.\\
+        All land at \bad{1.30--1.40\bpb}. \\
+        Lesson: \emph{at this scale, structured weights don't compete with
+        dense ones.}
+\end{itemize}
+\end{frame}
+
+% --------------------------------------------------------------- 7
+\begin{frame}{Question 3: Can we just stack the winners?}
+\textbf{Natural next move:} combine everything that worked --\\
+partial RoPE \emph{plus} INT6 (more bits) \emph{plus} 11 layers \emph{plus} a wider MLP.
+
+\vspace{0.8em}
 \centering
 \begin{tikzpicture}[every node/.style={font=\small, align=center}]
 \node[draw=ok, very thick, rounded corners, fill=ok!8,
-      minimum width=4.0cm, minimum height=1.1cm] (a)
+      minimum width=4.0cm, minimum height=1.0cm] (a)
       {Capacity expansion \\ \good{$-$0.063\bpb training}};
 \node[draw=accent, very thick, rounded corners, fill=accent!8,
-      minimum width=4.0cm, minimum height=1.1cm, right=1.0cm of a] (b)
+      minimum width=4.0cm, minimum height=1.0cm, right=1.0cm of a] (b)
       {INT6 quantizer \\ \bad{$+$0.120\bpb roundtrip}};
 \node[draw=ink, thick, rounded corners,
-      minimum width=3.0cm, minimum height=1.1cm, right=1.0cm of b] (c)
+      minimum width=2.6cm, minimum height=1.0cm, right=1.0cm of b] (c)
       {\Large $=$ \;\bad{net loss}};
 
 \draw[-{Stealth[length=4pt]}, thick] (a) -- (b);
 \draw[-{Stealth[length=4pt]}, thick] (b) -- (c);
 \end{tikzpicture}
 
-\vspace{0.7em}
-Training loss \good{1.1614\bpb} -- best ever.\\
-Final loss \bad{1.2816\bpb} -- worse than baseline.
+\vspace{0.8em}
+Training-time loss \good{1.1614\bpb} -- the best we'd ever seen.\\
+Final loss \bad{1.2816\bpb} -- worse than the simple baseline.
 
-\vspace{0.7em}
-\hil{Which lever is paying the bill -- the capacity, or the quantizer?}
+\vspace{0.8em}
+\hil{Which lever is responsible -- the capacity, or the quantizer?}
 \end{frame}
 
 % --------------------------------------------------------------- 8
-\begin{frame}{The decisive experiment: change one variable at a time}
-Two follow-ups, each isolating \emph{one} side of the trade:
+\begin{frame}{The answer: change one thing at a time}
+Two follow-ups, each isolating \emph{one} side of the trade.
 
+\vspace{0.4em}
 \begin{columns}[T,onlytextwidth]
 \column{0.55\textwidth}
 \centering
 \includegraphics[width=\linewidth]{curves_o5_resolved.pdf}
 
 \column{0.45\textwidth}
-\textbf{(a) Same arch, swap quantizer:}\\
-\footnotesize TurboQuant: rotate each weight row by a random orthogonal
-matrix, then quantize with a Lloyd--Max codebook tuned for the resulting
-distribution. Originally an \emph{inference-time} KV-cache method
-(Zandieh~2024); we apply it to weights at 4 bits.\\
-$\rightarrow$ \bad{3.60\bpb} final. Catastrophic.
+\textbf{(a) Same architecture, swap quantizer:}\\
+{\footnotesize TurboQuant: rotate each weight row by a random matrix, then
+quantize. Originally an \emph{inference-time KV-cache} method (Zandieh~2024);
+applied here to weights at 4 bits.}\\
+$\rightarrow$ \bad{3.60\bpb} final. The quantizer fails far below 8 bits.
 
 \vspace{0.5em}
-\normalsize\textbf{(b) Same quantizer, ease arch:}\\
+\normalsize
+\textbf{(b) Same quantizer, ease architecture:}\\
 INT8 $+$ 11~layers $+$ MLP$=$2.\\
-$\rightarrow$ \good{1.194\bpb}, $-$0.030 below reference.
+$\rightarrow$ \good{1.194\bpb}, \emph{0.030 below the reference.}
 
-\vspace{0.6em}
-\hil{Verdict: the quantizer was paying the bill.}\\
-{\footnotesize The architecture lever works -- as long as you don't crush precision to fund it.}
+\vspace{0.7em}
+\hil{The quantizer was the binding constraint.}\\
+{\footnotesize The architecture lever works -- as long as you don't crush
+precision to fund it.}
 \end{columns}
 \end{frame}
 
+% =====================================================================
+% PART III — FILLING IN THE PICTURE
+% =====================================================================
+
 % --------------------------------------------------------------- 9
-\begin{frame}{Three more levers we pushed (gains we banked + nulls we report)}
+\begin{frame}{What else we tried (gains, plus three honest nulls)}
 \small
 \begin{columns}[T,onlytextwidth]
 \column{0.5\textwidth}
-\textbf{O6 -- Multi-Query Attention.}\\
-{\scriptsize Share \emph{one} K/V projection across all heads instead of one per
-head. Frees parameters that fund a 12-layer model.}\\
+\textbf{Multi-Query Attention.}\\
+{\scriptsize Share \emph{one} K/V projection across all attention heads.
+Frees parameters that fund a 12-layer model.}\\
 \good{1.198\bpb} at 19.56~MB.\\[0.2em]
 \centering\includegraphics[width=0.95\linewidth]{curves_o6_mqa.pdf}
 
 \column{0.48\textwidth}
-\textbf{O7 -- QK-gain initialization.}\\
-{\scriptsize Per-head learnable scalar on the query projection.}\\
-$g_q^{(0)} \in \{1.5, 3.0, 5.0\}$. Spread \alert{0.002\bpb}. \\
-\hil{Null effect.} Learned $g_q$ converges regardless.\\[0.4em]
+\textbf{QK-gain initialization.}\\
+{\scriptsize A learnable scalar on the query projection.}\\
+Tried 1.5, 3.0, 5.0. Spread \alert{0.002\bpb}. \\
+\hil{Null effect.}\\[0.5em]
 
-\textbf{O8 -- LR / warmup sweep ($3{\times}3$).}\\
-Spread \alert{0.0019\bpb}. \\
-\hil{Null effect.} Default recipe is at the optimum.\\[0.4em]
+\textbf{Learning-rate / warmup sweep.}\\
+$3 \times 3$ grid. Spread \alert{0.0019\bpb}. \\
+\hil{Null effect.} The default recipe is already optimal.\\[0.5em]
 
-\textbf{O9 -- Eval protocol.}\\
-{\scriptsize Sliding-window eval: instead of scoring non-overlapping
-1024-token chunks, slide the window 256 tokens at a time so every token sees
-more left-context.}\\
-Same weights $\rightarrow$ \hil{1.160\bpb}. \textit{Not leaderboard-comparable, but a fair upper bound.}
+\textbf{Eval protocol matters.}\\
+{\scriptsize Sliding-window evaluation (move 256 tokens at a time, every token sees more
+context) scores \good{1.160\bpb} on the same weights -- but this is \emph{not}
+leaderboard-comparable, since the official protocol uses non-overlapping windows.}
 \end{columns}
 
-\vspace{0.5em}
-\hil{Three nulls are findings too} -- they constrain the design space and save future work.
+\vspace{0.4em}
+\hil{Three nulls reported as findings} -- they constrain the design space and save future work.
 \end{frame}
 
 % =====================================================================
-% ACT IV — THE BIG PICTURE
+% PART IV — THE BIG PICTURE
 % =====================================================================
 
 % --------------------------------------------------------------- 10
-\begin{frame}{The headline: 16~MB is an \emph{elbow}, not a wall}
+\begin{frame}{The full size--quality picture: a Pareto frontier}
 \centering
 \includegraphics[width=0.85\linewidth]{pareto_frontier.pdf}
 
 \vspace{-0.2em}
-{\scriptsize \textbf{Pareto frontier} = the lower-left envelope: each point on it is the best bpb
-\emph{achievable} at that size.}\\[0.2em]
-{\small Below 15.9~MB: every MB saved costs $\sim$0.02\bpb (steep).
-Above 15.9~MB: marginal gains flatten. \\
-\good{In-budget winner 1.215\bpb at 15.87~MB} \;\;|\;\; \good{over-budget winner 1.194\bpb at 19.30~MB}.}
+{\scriptsize \textbf{Pareto frontier} = lower-left envelope: each point is the
+best bpb \emph{achievable} at that size.}\\[0.2em]
+{\small \good{In-budget winner: 1.215\bpb at 15.87~MB.} \;\;|\;\;
+\good{Over-budget winner: 1.194\bpb at 19.30~MB.}\\
+\hil{16~MB is an elbow on the curve} -- not a hard cutoff.}
 \end{frame}
 
 % --------------------------------------------------------------- 11
-\begin{frame}{Are these numbers real, or seed luck?}
+\begin{frame}{Are these numbers real? -- multi-seed check}
 \begin{columns}[T,onlytextwidth]
 \column{0.55\textwidth}
 \centering
 \includegraphics[width=\linewidth]{multiseed_bars.pdf}
 
 \column{0.45\textwidth}
-We re-ran the three surviving in-budget axes at seeds $\{1337, 42, 123\}$:
+We re-ran the three surviving in-budget axes at three different random seeds.
+
+\vspace{0.5em}
 \begin{itemize}\small
-  \item INT8 PTQ: $\sigma = 0.0018$
+  \item INT8: $\sigma = 0.0018$
   \item Partial RoPE: $\sigma = 0.0011$
   \item Muon: $\sigma = 0.0015$
 \end{itemize}
 
 \vspace{0.7em}
-Per-axis effects ($\sim$0.05--0.20\bpb) are \\ \hil{$10$--$100\times$ larger
-than seed noise.} \\[0.3em]
-The single-seed claims hold up.
+Per-axis effects ($\sim$0.05--0.20\bpb) are \\
+\hil{$10$--$100\times$ larger than seed noise.}\\[0.3em]
+The findings hold up.
 \end{columns}
 \end{frame}
 
 % --------------------------------------------------------------- 12
 \begin{frame}{What we learned}
-\begin{enumerate}\setlength{\itemsep}{4pt}
-  \item \hil{Sub-INT8 weight quantization is fragile at this scale.}
-        QAT does not save INT6. Random rotation does not save INT4.
-        The quantizer, not the recipe, is the binding constraint.
-  \item \hil{Capacity expansion is real -- but only INT8 carries it.}
-        Same architecture: under INT6 it forfeits its gain;
-        under INT8 it lands $-$0.030\bpb below reference.
-  \item \hil{Inductive biases matter at the margin, not the headline.}
-        Partial RoPE, MQA, depth all help by $\sim$0.01--0.02\bpb;
-        none rivals the precision lever in effect size.
-  \item \hil{The 16~MB ``constraint'' is a soft Pareto elbow.}
-        $+3.3$~MB buys 0.020\bpb. Not a binary; a continuous trade.
-  \item \hil{Three nulls reported as findings:}
-        weight factorizations, QK-gain init, LR/warmup. \\
-        Negative results constrain the design space.
+\begin{enumerate}\setlength{\itemsep}{6pt}
+  \item \hil{The quantizer is the binding constraint.}
+        Below 8 bits, weight quantization breaks at this scale -- and no
+        clever fix (QAT, random rotation) saves it.
+
+  \item \hil{Architecture matters, but only if the quantizer can carry it.}
+        The same 11-layer model fails under INT6 and wins under INT8.
+
+  \item \hil{Inductive biases (RoPE, MQA, depth) matter at the margin.}
+        Each is worth a hundredth or two of a bpb -- real but small.
+
+  \item \hil{16~MB is a soft elbow on the frontier, not a hard cutoff.}
+        Spending 3.3~MB more buys 0.020\bpb -- a continuous trade.
+
+  \item \hil{Three nulls are findings too.}
+        Weight factorizations, QK-gain init, LR/warmup sweeps. Saying ``no''
+        rules out a region of the design space.
 \end{enumerate}
 \end{frame}
 
 % --------------------------------------------------------------- 13
+\begin{frame}{Where we started, where we ended}
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\small, align=center},
+  startbox/.style={rectangle, rounded corners=3pt, draw=warn, very thick,
+                   fill=warn!10, minimum width=5.0cm, minimum height=2.0cm,
+                   inner sep=4pt},
+  endbox/.style={rectangle, rounded corners=3pt, draw=ok, very thick,
+                 fill=ok!10, minimum width=5.0cm, minimum height=2.0cm,
+                 inner sep=4pt},
+  arr/.style={-{Stealth[length=8pt]}, primary, ultra thick}
+]
+\node[startbox] (start) {%
+\textbf{Where we started}\\[0.3em]
+\warn{\textbf{1.2244\bpb}} at 15.85~MB\\
+{\footnotesize one configuration} \\[0.3em]
+{\footnotesize no insight into what mattered}};
+
+\node[endbox, right=2.0cm of start] (end) {%
+\textbf{Where we ended}\\[0.3em]
+\good{\textbf{1.2147\bpb}} in-budget (15.87~MB)\\
+\good{\textbf{1.1944\bpb}} over-budget (19.30~MB)\\[0.3em]
+{\footnotesize $+$ runnable model code in \texttt{experiments/demo/}}};
+
+\draw[arr] (start) -- (end) node[midway, above, font=\scriptsize, primary] {46 runs};
+\end{tikzpicture}
+
+\vspace{0.9em}
+\small
+We didn't just \hil{beat the baseline} -- we mapped the \emph{entire
+size--quality curve} from 7~MB to 19~MB, and identified \emph{which}
+compression decisions earn the gain.
+
+\vspace{0.4em}
+{\footnotesize \texttt{experiments/demo/smoke\_test.py} loads a trained
+checkpoint, runs a forward pass on any prompt, and prints the top-$k$
+next-token predictions -- proof the artifact actually works.}
+\end{frame}
+
+% --------------------------------------------------------------- 14
 \begin{frame}[standout]
 Thank you.\\[0.5em]
 {\normalsize Questions?}\\[1.2em]
