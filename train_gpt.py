@@ -27,6 +27,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import wandb as _wandb
+    _wandb_available = True
+except ImportError:
+    _wandb_available = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -85,6 +91,11 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Weights & Biases
+    wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "0")))
+    wandb_project  = os.environ.get("WANDB_PROJECT", "parameter-golf")
+    wandb_entity   = os.environ.get("WANDB_ENTITY", "")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -894,6 +905,21 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+
+    if master_process and args.wandb_enabled and _wandb_available:
+        _wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.run_id,
+            config={
+                "num_layers": args.num_layers, "model_dim": args.model_dim,
+                "num_heads": args.num_heads, "num_kv_heads": args.num_kv_heads,
+                "mlp_mult": args.mlp_mult, "vocab_size": args.vocab_size,
+                "n_params": n_params, "seed": args.seed,
+                "iterations": args.iterations, "train_batch_tokens": args.train_batch_tokens,
+                "matrix_lr": args.matrix_lr, "embed_lr": args.embed_lr,
+            },
+        )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -993,6 +1019,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if master_process and args.wandb_enabled and _wandb_available:
+                _wandb.log({"val/loss": val_loss, "val/bpb": val_bpb, "step": step})
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1044,6 +1072,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if master_process and args.wandb_enabled and _wandb_available:
+                _wandb.log({"train/loss": train_loss.item(), "step": step})
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1117,6 +1147,10 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if master_process and args.wandb_enabled and _wandb_available:
+        _wandb.log({"final/val_bpb": q_val_bpb, "final/val_loss": q_val_loss})
+        _wandb.finish()
 
     if distributed:
         dist.destroy_process_group()

@@ -1,0 +1,596 @@
+\documentclass[11pt, letterpaper]{article}
+
+\usepackage[margin=0.7in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{caption}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue,
+    citecolor=black
+}
+
+\graphicspath{{analysis/}}
+
+\title{
+    \textbf{Progress Report} \\[0.4em]
+    \large Architecture and Training Design Under a Hard Parameter Budget \\[0.4em]
+    \normalsize DS 504: Big Data Analytics \textendash{} Spring 2026
+}
+
+\author{Shyam Patadia \\ \\ Worcester Polytechnic Institute}
+\date{April 21, 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+% -------------------------------------------------------
+\section{Summary of Progress}
+% -------------------------------------------------------
+
+This report documents progress on the controlled ablation study
+of architectural and training design choices for decoder-only
+language models under the 16~MB artifact constraint of the
+OpenAI Model Craft: Parameter Golf Challenge~\cite{paramgolf2026}.
+Since the proposal, all three primary objectives have reached
+convergent 20{,}000-step runs at seed 1337 on the WPI research
+cluster: O1 (quantization precision), O2 (positional encoding),
+and O3 (optimizer). An additional fourth exploratory axis --
+parameter-efficient weight factorizations (low-rank, block-diagonal,
+fixed random projection) -- was evaluated and falsified.
+Combining the best per-axis configurations into a single
+stacked run exposed a capacity-versus-quantization-noise
+tradeoff that is the central finding of this phase and directly
+motivates the remaining work.
+
+Key result: the best in-axis condition (partial RoPE, 9L/MLP=2,
+INT8) reaches 1.2147~bpb, a 0.010~bpb improvement over the
+1.2244~bpb reference. A stacked configuration
+(partial RoPE + INT6 + 11~layers + MLP multiplier~3) reaches
+1.1614~bpb during training but degrades to 1.2816~bpb post-quantization
+-- a 0.14~bpb gap that identifies INT6 uniform quantization as
+the dominant source of end-to-end loss in the capacity-expanded
+regime. Remaining work decomposes this gap along two orthogonal axes:
+a TurboQuant random-rotation quantizer~\cite{turboquant2024}
+applied to the same expanded architecture, and a pure
+architectural expansion (11L) under the known-safe INT8
+quantizer. Both jobs are in flight.
+
+% -------------------------------------------------------
+\section{Experimental Setup}
+% -------------------------------------------------------
+
+\subsection{Dataset and Tokenization}
+
+All models are trained from scratch on FineWeb~\cite{fineweb2024},
+a filtered, deduplicated Common Crawl derivative released by
+HuggingFace. Training uses a 10~billion-token shard
+(\texttt{fineweb10B}) and the 1{,}024-token SentencePiece BPE
+tokenizer (\texttt{sp1024}) adopted by the Parameter Golf
+challenge; the small vocabulary keeps the embedding table to
+$1024 \times d_{\text{model}}$ bytes under FP32, which matters
+substantially under a 16~MB artifact budget. Input/output
+embeddings are tied throughout.
+
+Training reads contiguous token streams of length
+$\ell_{\text{ctx}}=1024$ directly from pre-shuffled, pre-tokenized
+\texttt{uint16} binary shards; no on-the-fly tokenization is
+performed during training. Evaluation computes bits-per-byte
+(bpb) on a held-out FineWeb validation split using the official
+challenge evaluation protocol, so that our numbers are directly
+comparable to leaderboard submissions~\cite{paramgolf2026}.
+Total training exposure per condition is $\approx 10.5$~billion
+tokens (20{,}000 steps $\times$ 8 micro-batches $\times$
+2 GPUs $\times$ 1024 tokens, adjusted for gradient accumulation).
+
+\subsection{Model Architecture}
+
+The baseline architecture is a decoder-only transformer with the
+hyperparameters in Table~\ref{tab:arch}. Each block applies
+pre-norm $\rightarrow$ causal multi-head self-attention
+$\rightarrow$ pre-norm $\rightarrow$ gated MLP (SwiGLU), with a
+residual stream of width $d_{\text{model}}$. Ablations mutate
+exactly one axis per run relative to the baseline; arch-expansion
+runs (O5) mutate several axes jointly within the same artifact
+budget.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Symbol} & \textbf{Baseline value} \\
+\midrule
+Layers                    & $L$                  & $9$ \\
+Hidden dimension          & $d_{\text{model}}$   & $512$ \\
+Attention heads           & $h$                  & $8$ \\
+Head dimension            & $d_h$                & $64$ \\
+MLP expansion             & $m$                  & $2$ (SwiGLU) \\
+Context length            & $\ell_{\text{ctx}}$  & $1024$ \\
+Vocabulary                & $|V|$                & $1024$ (SentencePiece BPE) \\
+Tied embeddings           & --                   & input $=$ output \\
+Training steps            & $T$                  & $20{,}000$ \\
+Micro-batch / GPU / accum & --                   & $8 / 2 / \text{as-needed}$ \\
+Optimizer (baseline)      & --                   & Muon~\cite{muon2024} on matrix params, Adam on scalars \\
+Quantization (baseline)   & --                   & INT8 PTQ with per-row scales, \texttt{zlib} roundtrip \\
+\bottomrule
+\end{tabular}
+\caption{Baseline architecture and training hyperparameters. All
+experiments mutate exactly one axis from this baseline unless
+otherwise noted.}
+\label{tab:arch}
+\end{table}
+
+\subsection{Quantization and Artifact Pipeline}
+
+The 16~MB budget applies to the \emph{post-quantization, zlib-compressed}
+artifact plus training code. To mirror the leaderboard
+evaluation, every reported run performs the following
+artifact-production and round-trip pipeline at the end of
+training:
+
+\begin{enumerate}[leftmargin=*, topsep=0pt, itemsep=1pt]
+    \item Train in bfloat16 (or with QAT straight-through
+          estimators for INT6).
+    \item Quantize weights to the target precision with per-row
+          symmetric scales; keep 1D tensors (biases, norms) in
+          bfloat16 to avoid disproportionate error.
+    \item Serialize the quantized state-dict and \texttt{zlib.compress}
+          it; this is the artifact measured against 16~MB.
+    \item \emph{Round-trip}: decompress, dequantize, rehydrate
+          the model, re-run validation. This is the leaderboard-equivalent
+          \texttt{final/val\_bpb} reported throughout.
+\end{enumerate}
+
+Two distinct bpb numbers therefore exist for every run:
+\texttt{val/bpb} (training-time, bfloat16 in-memory parameters)
+and \texttt{final/val\_bpb} (post round-trip, what the leaderboard
+actually measures). The gap between them is the quantization
+penalty, and Section~\ref{sec:results} shows it is the central
+empirical object of this phase.
+
+% -------------------------------------------------------
+\section{Results by Objective}
+\label{sec:results}
+% -------------------------------------------------------
+
+Table~\ref{tab:results} aggregates the full grid of 20{,}000-step
+runs. All numbers are at seed 1337; multi-seed replication
+(seeds 42 and 123) is the final-phase deliverable. The
+\textsc{Final} column is leaderboard-equivalent bpb; the
+\textsc{Train} column is the in-memory bfloat16 validation
+bpb at the end of training. Their difference is the
+quantization gap $\Delta_q$.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}l l c c c c@{}}
+\toprule
+\textbf{Obj.} & \textbf{Condition} & \textbf{Train bpb}
+              & \textbf{Final bpb} & $\Delta_q$
+              & \textbf{vs.\ 1.2244} \\
+\midrule
+O1 & INT8 PTQ (baseline)              & 1.2082 & 1.2161 & $+0.008$ & $-0.008$ \\
+O1 & INT6 QAT + PTQ                   & 1.2083 & 1.3489 & $+0.141$ & $+0.125$ \\
+\midrule
+O2 & Learned absolute PE              & 1.2244 & 1.2349 & $+0.011$ & $+0.011$ \\
+O2 & Full RoPE                        & 1.2085 & 1.2174 & $+0.009$ & $-0.007$ \\
+O2 & No positional encoding           & 1.2589 & 1.2690 & $+0.010$ & $+0.045$ \\
+\textbf{O2} & \textbf{Partial RoPE ($d_{\text{rope}}{=}32$)}
+                                      & \textbf{1.2071} & \textbf{1.2147}
+                                      & $+0.008$ & $\mathbf{-0.010}$ \\
+\midrule
+O3 & AdamW (5k pilot)                 & 1.4065 & 1.4409 & $+0.034$ & $+0.217$ \\
+O3 & Adafactor (5k pilot)             & 1.4879 & 1.4895 & $+0.002$ & $+0.265$ \\
+O3 & Muon (baseline, 20k)             & 1.2089 & 1.2168 & $+0.008$ & $-0.008$ \\
+\midrule
+O4 & Low-rank $r{=}128$               & 1.2915 & 1.3014 & $+0.010$ & $+0.077$ \\
+O4 & Block-diag $g{=}4$               & 1.3700 & 1.3830 & $+0.013$ & $+0.159$ \\
+O4 & Fixed random proj.\ $k{=}128$    & 1.3838 & 1.3958 & $+0.012$ & $+0.171$ \\
+\midrule
+O5 & Partial RoPE + INT6 + 11L + MLP=3 & \textbf{1.1614} & 1.2816 & $\mathbf{+0.120}$ & $+0.057$ \\
+\bottomrule
+\end{tabular}
+\caption{Full 20{,}000-step results at seed 1337, reported as
+bits-per-byte on the FineWeb held-out split. \textsc{Train} is
+the in-memory bfloat16 loss; \textsc{Final} is the post-quantize,
+zlib round-trip loss (leaderboard-equivalent). $\Delta_q$ is the
+quantization gap. Reference 1.2244 is the challenge's published
+INT8 score for this architecture.}
+\label{tab:results}
+\end{table}
+
+\subsection{O1 -- Quantization Precision}
+
+Figure~\ref{fig:o1} plots validation bpb against step for the
+INT8 and INT6 conditions. In-memory training loss is nearly
+identical between the two (both $\approx 1.208$ at step 20{,}000);
+the critical difference appears only after the round-trip.
+INT8 with per-row symmetric scales incurs a negligible
+$\Delta_q = 0.008$~bpb. INT6 under the same scheme incurs
+$\Delta_q = 0.141$~bpb -- more than sixteen times as large
+-- even with QAT applied throughout. The INT6 penalty is not a
+training-dynamics problem: the straight-through estimator reaches
+the same loss as INT8, but uniform scalar quantization at 6~bits
+cannot represent the post-training weight distribution without
+appreciable error. This result contradicts the optimistic
+prediction from existing precision scaling
+laws~\cite{scalingprecision} in the sub-21M parameter regime
+and reframes INT6 as a capacity multiplier that is only useful
+if a better quantizer is supplied.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.80\textwidth]{curves_o1_quant.png}
+\caption{O1 -- post-warmup validation bpb over training steps
+for INT8 (baseline) and INT6 (QAT). In-memory loss converges
+to the same point; the divergence shown in
+Table~\ref{tab:results} emerges only under the post-training
+round-trip.}
+\label{fig:o1}
+\end{figure}
+
+\subsection{O2 -- Positional Encoding}
+
+Four positional-encoding schemes were compared under
+otherwise-identical architecture and quantization
+(INT8 PTQ, 9L, MLP=2). The ordering at 20{,}000 steps is
+\emph{partial RoPE $<$ full RoPE $<$ learned absolute $\ll$ none},
+with partial RoPE at 1.2147~bpb becoming the best in-axis
+condition of this study. The gap between partial RoPE and no-PE
+(1.2690) is 0.054~bpb, dwarfing the gap between partial RoPE
+and full RoPE (0.003~bpb). Absolute-position information matters
+at this scale; the \emph{form} of the positional prior is a
+second-order variable. Partial RoPE's advantage specifically
+comes from applying rotary encoding to only the first 32 of
+each head's 64 dimensions, leaving the remainder as pure
+content dimensions and freeing parameters that learned
+embeddings would otherwise require~\cite{rope}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.80\textwidth]{curves_o2_posenc.png}
+\caption{O2 -- validation bpb over training for the four
+positional-encoding variants. \emph{No PE} trails clearly;
+the three schemes with position information converge to
+within 0.02~bpb of each other, with partial RoPE lowest.}
+\label{fig:o2}
+\end{figure}
+
+\subsection{O3 -- Optimizer}
+
+The two comparison optimizers are included for distinct,
+budget-relevant reasons. \textbf{AdamW} is the universal default
+in language-model training; without an AdamW counterfactual,
+the choice of Muon would be an unjustified pick rather than a
+finding, and the central claim that ``Muon is load-bearing at
+this scale'' would be unfalsifiable. \textbf{Adafactor} is
+specifically motivated by the 16~MB constraint: its factorized
+second moment reduces optimizer-state memory from $O(n)$ to
+$O(\sqrt{n})$, which directly tests whether sacrificing
+second-moment fidelity buys back enough training-time GPU
+memory to fit a deeper or wider model under the same wallclock.
+Both are therefore lever-tests, not throat-clearing.
+
+The data falsifies both alternatives. Muon, which applies
+Nesterov-momentum updates along the Newton--Schulz-orthogonalized
+gradient of each 2D weight matrix~\cite{muon2024}, reaches
+1.2168~bpb and is indistinguishable from the challenge-reference
+INT8 baseline. AdamW at tuned learning rates plateaus $>$0.2~bpb
+higher; Adafactor's factorized second moment loses even more
+(see Table~\ref{tab:results}). At under 5M trainable parameters,
+the optimizer-state savings Adafactor offers do not compensate
+for its loss-quality penalty, and AdamW's per-parameter second
+moment provides no advantage over Muon's orthogonalization at
+this scale. Muon is therefore retained as the matrix-parameter
+optimizer for all subsequent experiments, with Adam on scalars.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.80\textwidth]{curves_o3_optim.png}
+\caption{O3 -- validation bpb over training for the optimizer
+comparison. Muon converges to a qualitatively different loss
+band than either AdamW or Adafactor at this scale.}
+\label{fig:o3}
+\end{figure}
+
+\subsection{O4 -- Parameter-Efficient Factorizations (exploratory)}
+
+Three structured weight parametrizations were evaluated to
+test whether they could liberate capacity under the 16~MB
+budget: low-rank ($W = UV^\top$ with $r = 128$), block-diagonal
+($g = 4$), and fixed random projection ($W = PR$ with frozen
+random $R$, rank 128). All three landed between 1.30 and 1.40~bpb,
+cleanly worse than the dense INT8 baseline at 1.2161. The random-projection
+variant was further retested at 12 layers to rule out capacity
+starvation; it improved to 1.3601 but still failed to clear
+baseline. O4 is therefore reported as a null result: under this
+budget and token horizon, structured weight factorizations
+cannot compete with dense matrices. The implication is that
+capacity expansion, if desired, should come from depth/width
+rather than from a parametrization trick.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.80\textwidth]{curves_o4_weightparam.png}
+\caption{O4 -- weight-parametrization variants all converge
+above the dense INT8 baseline, regardless of which structural
+prior is imposed. This axis is falsified as a capacity lever
+at our scale.}
+\label{fig:o4}
+\end{figure}
+
+\subsection{O5 -- Stacked Configuration (the central finding)}
+
+Combining O1--O3's winning choices (partial RoPE, INT6 for
+capacity, Muon) with a widened architecture (11 layers,
+MLP multiplier 3) produces the most informative run of this
+phase. In training-time bfloat16, the stacked configuration
+reaches \textbf{1.1614~bpb} -- 0.047~bpb below the best
+single-axis result and 0.063~bpb below the reference 1.2244.
+After the round-trip, however, it degrades to 1.2816~bpb,
+forfeiting the entire training-time gain and landing \emph{worse}
+than the INT8 baseline.
+
+The decomposition is unambiguous. The 11L/MLP=3 arch expansion
+genuinely improves in-memory capacity; the INT6 precision
+chosen to fund that expansion imposes a 0.12~bpb quantization
+penalty (consistent with the 0.14~bpb penalty measured
+independently in O1). The two effects nearly cancel. This is
+the key empirical finding of the phase: \emph{at this scale,
+post-quantization loss -- not training-time loss -- is the
+binding constraint, and the dominant knob governing post-quant
+loss is the quantizer itself, not the architecture}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.80\textwidth]{curves_o5_stacked.png}
+\caption{O5 -- the stacked configuration (partial RoPE + INT6
++ 11L + MLP=3) vs.\ the INT8 baseline. Training-time loss
+(dashed) shows a clear capacity win; final round-trip loss
+(solid) does not. The gap between the two lines is the
+quantization penalty.}
+\label{fig:o5}
+\end{figure}
+
+% -------------------------------------------------------
+\section{Key Findings}
+% -------------------------------------------------------
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{INT6 uniform scalar quantization is fragile at
+          this scale.} A $\Delta_q$ of 0.14~bpb dwarfs every
+          other axis's effect. QAT does not close this gap;
+          training-time and in-memory losses are already matched.
+          The problem is the quantizer, not the training recipe.
+    \item \textbf{Partial RoPE ($d_{\text{rope}}=32$) is the
+          strongest in-axis modification.} 1.2147~bpb post-round-trip
+          beats all other single-axis conditions and equals the
+          stacked configuration's \emph{final} loss without any
+          of the quantization risk.
+    \item \textbf{Muon is load-bearing, not marginal.} At under
+          5M parameters, AdamW and Adafactor lose more than 0.2~bpb.
+          This axis should not be a free parameter in subsequent
+          experiments.
+    \item \textbf{Structured weight factorizations do not help.}
+          O4 is a falsified hypothesis and removes a large
+          region of the design space from consideration.
+    \item \textbf{Capacity expansion is real but quantization-gated.}
+          The stacked configuration demonstrates a
+          $\approx$~0.06~bpb training-time gain from 11L/MLP=3,
+          which is recoverable if and only if we can deliver
+          a 3--4-bit quantizer with sub-0.02~bpb round-trip
+          penalty. That is the remit of the final phase.
+\end{enumerate}
+
+% -------------------------------------------------------
+\section{In-Progress and Planned Work}
+% -------------------------------------------------------
+
+\subsection{TurboQuant at 4~bits (in flight)}
+
+The INT6 fragility result directly motivates TurboQuant~\cite{turboquant2024},
+which attacks exactly the failure mode we observe. TurboQuant
+applies a random rotation $R$ to each matrix row before scalar
+quantization; because a random rotation of an arbitrary
+$\ell_2$-bounded vector is concentrated on a Beta distribution
+with known moments, a Lloyd--Max scalar quantizer designed for
+that distribution achieves provably near-optimal MSE at very
+low bit widths. TurboQuant reports quality neutrality at
+3.5~bits on LLaMA KV-cache quantization~\cite{turboquant2024};
+we apply the same machinery to model \emph{weights} in the
+post-training quantizer at 4~bits, via the pure-PyTorch
+\texttt{pyturboquant} reference implementation.
+
+Two jobs are currently queued, addressing the two distinct
+ways the post-quantization gap can be closed:
+\begin{itemize}[leftmargin=*, topsep=0pt, itemsep=1pt]
+    \item \textbf{TurboQuant-INT4 at 11L + MLP=3}: a direct
+          rerun of the stacked configuration with INT6 replaced
+          by TurboQuant-INT4. This isolates the quantizer as
+          the variable: same architecture, same token budget,
+          same in-memory capacity target, only the
+          quantization scheme changes. If TurboQuant reduces
+          $\Delta_q$ to the $<0.02$~bpb range observed for INT8,
+          the training-time 1.1614 carries through to the
+          final score.
+    \item \textbf{INT8 at 11L + MLP=2}: keeps INT8 PTQ fixed and
+          expands capacity by one architectural notch above the
+          baseline (9L $\rightarrow$ 11L). This isolates
+          architecture as the variable under a quantizer with
+          known, small $\Delta_q$, and quantifies how much of
+          the stacked configuration's training-time gain is
+          attributable to depth alone versus the
+          depth\,$+$\,MLP-width combination.
+\end{itemize}
+
+Together the two jobs decompose the O5 result along orthogonal
+axes: one varies the quantizer with architecture held at the
+expanded setting, the other varies the architecture with the
+quantizer held at the safe setting. The combined evidence
+identifies which lever -- precision or capacity -- is the
+binding constraint at this budget.
+
+\subsection{Per-Condition Learning-Rate and Warmup Sweep}
+
+The proposal specified that learning rate and warmup be tuned
+independently per condition. To stay within cluster budget while
+covering the full design grid, this phase used a single
+hyperparameter setting (the baseline's tuned values) across all
+ablations, treating it as a fair-comparison shared baseline
+rather than per-condition optima. This is a known source of
+under-reporting: at this scale a proper LR/warmup sweep is
+typically worth 0.01--0.03~bpb per condition, and conditions
+that change effective gradient scale most (e.g., the partial
+RoPE attention modification, MLP-multiplier changes, and the
+TurboQuant-INT4 weight distribution) are the most likely to
+benefit from re-tuning.
+
+The remaining phase will execute a per-condition sweep over
+$\{0.5, 1.0, 2.0\}\times$ the baseline learning rate and over
+warmup fractions $\{0.05, 0.10, 0.15\}$ for the configurations
+that survive into the multi-seed phase. Reported final numbers
+for those configurations will use the per-condition optimum
+rather than the shared baseline setting; the difference will
+be itemized in the final report so the contribution of tuning
+versus the contribution of each ablation is visible.
+
+\subsection{Multi-Seed Replication}
+
+The proposal's three-seeds-per-condition protocol will be
+executed for the configuration that yields the lowest final
+bpb among the two in-flight jobs and for the core axis
+ablations (partial RoPE, full RoPE, learned, none; INT8 vs.\
+INT6; Muon), each at its per-condition LR/warmup optimum from
+the sweep above. Seeds 42 and 123 are already queued in
+\texttt{next\_steps.sh} and will be launched as cluster
+bandwidth allows. Final reported numbers will be
+mean $\pm$ standard deviation across three seeds.
+
+\subsection{Tentative Demonstration}
+
+Scope permitting, the final 16~MB artifact will be packaged
+as an in-browser interpretability tool: a static web page that
+accepts a user-typed prefix and renders, in real time, the
+top-$k$ next-token distribution with probability bars, the
+per-head attention heatmap over input tokens, and the
+hidden-state magnitudes across layers. Inference runs entirely
+client-side via ONNX Runtime Web; no server is involved.
+The choice of an interpretability surface rather than a generic
+autocomplete UI is deliberate -- the model's small size makes
+every internal state cheap to render live, which is infeasible
+at the scale of conventional language models, and turns the
+16~MB constraint into a pedagogical feature rather than just a
+scoring axis. This is a stretch deliverable; the report's
+quantitative results stand independently of whether it ships.
+
+\subsection{Revised Schedule}
+
+\begin{longtable}{@{}p{2.8cm} p{9cm} p{2.8cm}@{}}
+\toprule
+\textbf{Period} & \textbf{Tasks} & \textbf{Deliverable} \\
+\midrule
+\endfirsthead
+Apr 21 -- Apr 27 &
+Complete TurboQuant-INT4 and INT8 11L-expansion 20k runs;
+attribute the O5 training-time gain to quantizer vs.\
+architecture; per-condition LR/warmup sweep on surviving
+configurations &
+Quantizer/architecture attribution; tuned hyperparameters \\[4pt]
+Apr 28 -- May 3 &
+Multi-seed replication at per-condition LR optima;
+mean $\pm$ std tables; isolate the tuning contribution
+from the ablation contribution; write final report;
+prepare presentation &
+Camera-ready report \\[4pt]
+\textbf{May 5} &
+\textbf{Final project due} &
+\textbf{Report, code, slides} \\
+\bottomrule
+\end{longtable}
+
+% -------------------------------------------------------
+\section{Technical Stack}
+% -------------------------------------------------------
+
+Python 3.12, PyTorch 2.8 (CUDA 12.6), HuggingFace
+\texttt{datasets} and \texttt{tokenizers}, \texttt{torchao}
+for the INT6 QAT path, \texttt{pyturboquant}~\cite{turboquant2024}
+for random-rotation post-training quantization, Muon as the
+matrix-parameter optimizer, Weights \& Biases for experiment
+tracking, SLURM for cluster job scheduling on the WPI academic
+partition (2$\times$GPU per job).
+
+% -------------------------------------------------------
+\section*{References}
+\begingroup
+\renewcommand{\section}[2]{}
+\begin{thebibliography}{9}
+
+\bibitem{paramgolf2026}
+OpenAI.
+\newblock {OpenAI Model Craft: Parameter Golf Challenge}, 2026.
+\newblock \url{https://github.com/openai/parameter-golf}
+
+\bibitem{fineweb2024}
+Penedo, G. et al.
+\newblock {The FineWeb Datasets: Decanting the Web for the Finest
+Text Data at Scale}.
+\newblock \textit{arXiv preprint arXiv:2406.17557}, 2024.
+
+\bibitem{scalingprecision}
+Kumar, K. et al.
+\newblock {Scaling Laws for Precision}.
+\newblock \textit{ICLR}, 2025.
+\newblock \textit{arXiv preprint arXiv:2403.08540}.
+
+\bibitem{rope}
+Su, J. et al.
+\newblock {RoFormer: Enhanced Transformer with Rotary Position
+Embedding}.
+\newblock \textit{arXiv preprint arXiv:2104.09864}, 2021.
+
+\bibitem{muon2024}
+Jordan, K. et al.
+\newblock {Muon: An Optimizer for the Hidden Layers of Neural
+Networks}.
+\newblock Technical report, 2024.
+
+\bibitem{turboquant2024}
+Zandieh, A. et al.
+\newblock {TurboQuant: Online Vector Quantization with Near-Optimal
+Distortion Rate}.
+\newblock \textit{arXiv preprint}, 2024.
+
+\bibitem{kaplan2020}
+Kaplan, J. et al.
+\newblock {Scaling Laws for Neural Language Models}.
+\newblock \textit{arXiv preprint arXiv:2001.08361}, 2020.
+
+\bibitem{hoffmann2022}
+Hoffmann, J. et al.
+\newblock {Training Compute-Optimal Large Language Models}.
+\newblock \textit{arXiv preprint arXiv:2203.15556}, 2022.
+
+\end{thebibliography}
+\endgroup
+
+\end{document}

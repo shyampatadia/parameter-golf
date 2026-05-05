@@ -1,0 +1,250 @@
+\documentclass[12pt, letterpaper]{article}
+
+\usepackage[margin=0.4in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue,
+    citecolor=black
+}
+
+\title{
+    \textbf{Project 5} \\[0.4em]
+    \large Architecture and Training Design Under a Hard Parameter Budget \\[0.4em]
+    \normalsize DS 504: Big Data Analytics \textendash{} Spring 2026
+}
+
+\author{Shyam Patadia \\ \\ Worcester Polytechnic Institute}
+\date{March 24, 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+% -------------------------------------------------------
+\section{Overview}
+% -------------------------------------------------------
+
+This project conducts a controlled ablation study of architectural
+and training design choices for decoder-only language models
+trained from scratch under a hard 16~MB artifact constraint,
+as defined by the OpenAI Model Craft: Parameter Golf
+Challenge~\cite{paramgolf2026}. The constraint requires that
+model weights and training code combined not exceed 16,000,000
+bytes. Model quality is evaluated by bits per byte (bpb) on
+a held-out slice of the FineWeb~\cite{fineweb2024} validation
+set, using the evaluation protocol from the official challenge
+repository.
+
+The experimental baseline is the NanoGPT-style decoder-only
+transformer provided in the official challenge repository:
+a 9-layer, 512-hidden-dimension model with a 1,024-token
+SentencePiece vocabulary, tied input/output embeddings, and a
+score of 1.2244~bpb~\cite{paramgolf2026}. All models are
+initialized from scratch and trained on the FineWeb training
+shard. No pretrained weights are used.
+
+At FP32, the 16~MB budget accommodates approximately 4~million
+parameters; at INT6, approximately 21~million. Quantization
+precision therefore directly governs available model capacity,
+rendering it a first-order design variable. The constraint
+similarly makes positional encoding and optimizer state
+footprint measurable in units of effective parameter count.
+The existing literature on efficient language models typically
+evaluates design choices in combination, confounding
+attribution. This study varies each axis independently under
+identical token budgets and per-configuration hyperparameter
+tuning.
+
+% -------------------------------------------------------
+\section{Proposed Work}
+% -------------------------------------------------------
+
+\subsection{Model and Training Setup}
+
+All configurations are decoder-only transformers trained from
+scratch using \texttt{train\_gpt.py} from the official
+Parameter Golf repository. The sp1024 SentencePiece vocabulary
+is fixed across all experiments. Each configuration modifies
+exactly one design axis relative to the baseline; parameters
+freed by any modification are reallocated to model depth or
+width such that total artifact size remains at or below 16~MB
+across all conditions. All models are trained on WPI's
+research cluster via SLURM.
+
+\subsection{Research Objectives}
+
+All primary configurations are evaluated on identical total
+tokens from the same FineWeb training shard, trained to
+convergence under early stopping on validation bpb. Learning
+rate and warmup are tuned independently per configuration.
+Results are reported as mean and standard deviation across
+three independent random seeds. Exploratory conditions are
+included where stable convergence is verified; results are
+reported on a best-effort basis.
+
+\begin{enumerate}[leftmargin=*, label=\textbf{O\arabic*.}]
+
+    \item \textbf{Quantization Precision: BF16 vs.\ INT8
+    vs.\ INT6.}
+    Reducing precision from BF16 to INT8 doubles the effective
+    parameter count within the artifact limit; INT6 triples it,
+    making quantization the highest-leverage variable under
+    this constraint. This objective examines whether the
+    scaling laws for precision derived by Kumar et
+    al.~\cite{scalingprecision} hold in the sub-21M parameter
+    regime, and whether quantization noise from straight-through
+    estimators during QAT erodes the capacity benefit. BF16
+    and INT8 constitute the primary comparison; INT6 is
+    included as an exploratory condition given its experimental
+    support in \texttt{torchao}, with results reported where
+    training converges stably. Bpb, training loss variance,
+    and final artifact size are reported per precision level.
+
+    \item \textbf{Positional Encoding: Learned vs.\ Full RoPE
+    vs.\ None vs.\ Partial RoPE.}
+    Learned absolute positional embeddings incur a parameter
+    cost proportional to sequence length times hidden dimension.
+    RoPE~\cite{rope} introduces no additional parameters,
+    encoding relative position via
+    $q_m^\top k_n = f(q,k,m-n)$. Freed parameters are
+    reallocated to model capacity under a constant artifact
+    budget. Learned embeddings, full RoPE, and no positional
+    encoding constitute the primary conditions. Partial RoPE,
+    which applies rotary embeddings to a subset of attention
+    heads and requires direct attention kernel modification,
+    is included as an exploratory condition with results
+    reported where implementation is verified stable.
+
+    \item \textbf{Optimizer: AdamW vs.\ Muon vs.\ Adafactor.}
+    AdamW maintains per-parameter first and second moment
+    estimates. Muon applies Nesterov momentum along the
+    orthogonalized gradient. Adafactor factorizes the second
+    moment, reducing optimizer-state memory from $O(n)$ to
+    $O(\sqrt{n})$. Each optimizer is evaluated at its tuned
+    learning rate optimum; reported metrics include
+    convergence rate, final bpb, and total memory footprint
+    including optimizer state.
+
+\end{enumerate}
+
+\subsection{Evaluation}
+
+All configurations are evaluated on the held-out FineWeb
+validation split from the official challenge repository,
+ensuring reproducibility and comparability with existing
+submissions. The 1.2244~bpb baseline constitutes the primary
+reference. Results are reported as bpb delta over baseline
+with standard deviation across seeds. All code, trained
+checkpoints, and experiment logs will be released publicly
+as a non-record submission to the official challenge
+repository~\cite{paramgolf2026}.
+
+% -------------------------------------------------------
+\section{Technical Stack}
+% -------------------------------------------------------
+
+Python 3.11, PyTorch 2.x, HuggingFace \texttt{datasets} and
+\texttt{tokenizers}, \texttt{torchao} for low-precision QAT,
+Weights \& Biases for experiment tracking, SLURM for cluster
+job scheduling.
+
+% -------------------------------------------------------
+\section{Schedule}
+% -------------------------------------------------------
+
+\begin{longtable}{@{}p{2.8cm} p{8cm} p{2.8cm}@{}}
+\toprule
+\textbf{Period} & \textbf{Tasks} & \textbf{Deliverable} \\
+\midrule
+\endfirsthead
+Mar 24 -- Mar 30 &
+Confirm baseline bpb; implement INT8
+QAT via \texttt{torchao}; begin INT6
+QAT integration; run LR sensitivity
+sweep &
+Baseline confirmed \\[4pt]
+Mar 31 -- Apr 6 &
+O1: Primary QAT runs (BF16, INT8)
+to convergence; INT6 exploratory
+runs where stable &
+Quantization results \\[4pt]
+Apr 7 -- Apr 13 &
+O2: Primary positional encoding
+runs (learned, full RoPE, none);
+partial RoPE exploratory
+implementation &
+Positional encoding results \\[4pt]
+Apr 14 -- Apr 20 &
+O3: Optimizer comparison; progress
+report draft &
+Progress report draft \\[4pt]
+\textbf{Apr 21} &
+\textbf{Progress report due} &
+\textbf{5-page report} \\[4pt]
+Apr 22 -- Apr 28 &
+Full analysis; convergence plots,
+bpb tables, throughput results;
+complete paper draft; presentation
+slides; non-record submission &
+Camera-ready report \\[4pt]
+\textbf{May 5} &
+\textbf{Final project due} &
+\textbf{Report, code, slides} \\
+\bottomrule
+\end{longtable}
+
+% -------------------------------------------------------
+\section*{References}
+\begingroup
+\renewcommand{\section}[2]{}
+\begin{thebibliography}{9}
+
+\bibitem{paramgolf2026}
+OpenAI.
+\newblock {OpenAI Model Craft: Parameter Golf Challenge}, 2026.
+\newblock \url{https://github.com/openai/parameter-golf}
+
+\bibitem{fineweb2024}
+Penedo, G. et al.
+\newblock {The FineWeb Datasets: Decanting the Web for the Finest
+Text Data at Scale}.
+\newblock \textit{arXiv preprint arXiv:2406.17557}, 2024.
+
+\bibitem{kaplan2020}
+Kaplan, J. et al.
+\newblock {Scaling Laws for Neural Language Models}.
+\newblock \textit{arXiv preprint arXiv:2001.08361}, 2020.
+
+\bibitem{hoffmann2022}
+Hoffmann, J. et al.
+\newblock {Training Compute-Optimal Large Language Models}.
+\newblock \textit{arXiv preprint arXiv:2203.15556}, 2022.
+
+\bibitem{scalingprecision}
+Kumar, K. et al.
+\newblock {Scaling Laws for Precision}.
+\newblock \textit{ICLR}, 2025.
+\newblock \textit{arXiv preprint arXiv:2403.08540}.
+
+\bibitem{rope}
+Su, J. et al.
+\newblock {RoFormer: Enhanced Transformer with Rotary Position
+Embedding}.
+\newblock \textit{arXiv preprint arXiv:2104.09864}, 2021.
+
+\end{thebibliography}
+\endgroup
+
+\end{document}
