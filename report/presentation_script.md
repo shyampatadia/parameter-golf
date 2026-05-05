@@ -179,6 +179,70 @@ Thank you. The full report and code are on the GitHub link. Happy to take questi
 
 ---
 
+## Anticipated Q&A
+
+Questions a faculty audience is likely to ask, with concise answers that demonstrate command of the underlying concepts. Read these once before the talk so the answers come naturally — don't memorize verbatim.
+
+### On the metric
+
+**Q: What exactly is the relationship between bpb and the cross-entropy loss your model optimizes?**
+A: The model is trained with token-level cross-entropy in nats. To get bits-per-byte, I convert to bits (divide by `ln(2)`) and rescale by the average tokens-per-byte ratio of the tokenizer. So bpb is just cross-entropy expressed per-byte instead of per-token, which makes it tokenizer-agnostic and directly comparable across vocabularies.
+
+**Q: Wouldn't a larger vocabulary give a lower bpb? Why use only 1,024 tokens?**
+A: A larger vocab usually gives lower per-token loss because each token carries more information, but bpb is normalized per byte, so the gain is much smaller than it looks per-token. Meanwhile, the embedding table grows linearly with vocab size and we have a hard 16 MB budget — at 1,024 tokens the embedding is already a meaningful fraction of the artifact. The challenge fixes the tokenizer at sp1024 specifically so all submissions are comparable on the same metric.
+
+**Q: How is bpb related to perplexity?**
+A: They're the same quantity in different units. Perplexity is `exp(cross-entropy in nats)`, bpb is `cross-entropy in bits per byte`. Lower bpb is exponentially lower perplexity.
+
+### On quantization
+
+**Q: What's the difference between PTQ and QAT, and why didn't QAT save INT6?**
+A: PTQ — post-training quantization — quantizes the weights *after* training, with no awareness of quantization during training. QAT inserts a fake-quantization op into the forward pass during training, with a straight-through estimator on the backward pass, so the model can learn weights that survive rounding. QAT *did* match in-memory loss for INT6 — that part worked. But the round-trip still degraded by 0.14 bpb, because the post-training rounding error from 6-bit uniform bins is too large *relative to the spread of the trained weight distribution* at this scale. QAT teaches the model to be robust to a small, fixed rounding error; it can't make uniform 6-bit bins finer.
+
+**Q: Why per-row symmetric scales and not per-tensor or asymmetric?**
+A: Per-row scales — one scale factor per output row of each weight matrix — let each row use the full integer range, which costs one extra float per row but keeps the per-element MSE near minimum. Per-tensor would force a single scale across very different rows and lose accuracy. Symmetric (no zero-point) is enough because trained weights are roughly zero-centered, and skipping the zero-point saves storage. We keep 1D tensors like biases and norms in bfloat16 because their parameter count is tiny and the relative quantization error on them would be disproportionate.
+
+**Q: Why does TurboQuant fail on weights when it works on the KV-cache?**
+A: TurboQuant's guarantee comes from rotating an `L2`-bounded vector and applying a Lloyd–Max codebook designed for the resulting concentration distribution. That assumption is a clean fit for KV-cache rows at inference time — they're activations with bounded norm. Trained weight rows at our scale don't have the same statistics: the distribution after rotation isn't well-matched to the codebook, and 4 bits is below the threshold where the bound is tight. So we're applying the method outside the regime it was validated on, and the scalar quantizer simply doesn't have enough resolution.
+
+**Q: Could you have rescued INT6 with smarter quantization — say, GPTQ or AWQ?**
+A: Possibly — those methods use Hessian-aware error compensation that I didn't try. The takeaway from this study is narrower: under the same quantizer family that the challenge ships (per-row symmetric uniform), 6 bits is below the threshold of viability at this scale, and QAT alone doesn't close the gap. A follow-up using GPTQ-style methods is the natural next experiment.
+
+### On architecture and training
+
+**Q: What does Muon actually do, and why does it beat AdamW here?**
+A: Muon takes the gradient of each 2D weight matrix and orthogonalizes it via a few Newton–Schulz iterations before applying a momentum step. That keeps every singular direction of the update at unit scale, which acts as an implicit per-direction normalization. At our parameter count — under 5 million trainable parameters — AdamW's per-element second moment is noisy and Adafactor's factorized version is even more so; Muon's matrix-level conditioning produces cleaner updates. The 0.2 bpb gap is large because the noise floor matters more when there's less signal.
+
+**Q: How is partial RoPE different from full RoPE, and why did it win?**
+A: RoPE rotates each query and key by an angle proportional to the token's position. Full RoPE applies that rotation to all dimensions of every head. Partial RoPE applies it to only the first 32 of 64 head dimensions, leaving the remainder as un-rotated content dimensions. The hypothesis — and what the data supports — is that the model uses position information for some attention patterns but not others, so reserving content-only dimensions gives it more flexibility. The gap to full RoPE is small (about 0.003 bpb), so I wouldn't oversell the win.
+
+**Q: MQA vs. GQA — what's the trade-off?**
+A: MQA shares a single K/V projection across all attention heads. GQA shares K/V across small groups. MQA is more parameter-efficient but throws away some expressive capacity in attention. At our scale, the parameters MQA frees up are worth more than the expressive loss, because they fund a 12-layer model.
+
+### On methodology
+
+**Q: Why 20,000 steps? Could the rankings flip with longer training?**
+A: 20k steps was set by the challenge as the reference horizon, so all conditions have the same compute budget. Whether rankings flip at longer horizons is a fair question — I don't claim they don't. The Kaplan-style scaling-laws literature suggests rankings at this parameter count are stable, but at this token-to-parameter ratio I can't rule it out. It's a stated limitation in the report.
+
+**Q: Three seeds — is that statistically meaningful?**
+A: Three seeds gives us a sample standard deviation, not a tight confidence interval. The relevant fact is that the per-axis effects are 10 to 100 times the seed `σ` we measured (around 0.001–0.002 bpb), so the *ranking* between conditions is robust even with three seeds. The exact mean is not — for that, more seeds would help.
+
+**Q: Did you tune hyperparameters per-condition, or use shared settings?**
+A: For the headline single-axis runs, I used the challenge's reference learning rate and warmup across all conditions to keep the comparison fair. For the in-budget winner I then ran a 3×3 LR-warmup sweep, which came back null — a 0.0019 bpb spread, below the multi-seed noise. So the shared settings are at or near the optimum for the dominant axes. I don't claim this for *every* axis — it's a stated limitation.
+
+### On the conclusions
+
+**Q: How is the 19.3 MB result a "win" if it doesn't fit the 16 MB budget?**
+A: I'm not claiming it as a leaderboard submission — that would be cheating. I'm reporting it as one point on the size-quality Pareto curve. The real contribution is the curve itself: it tells us that 3.3 megabytes of overage buys 0.020 bpb, and it identifies which design decisions earn that gain. The in-budget winner at 1.215 bpb is the leaderboard-relevant result; the over-budget point is a research finding about the shape of the trade-off.
+
+**Q: Could the Pareto frontier change with more compute or different architectures?**
+A: The frontier I report is the lower-left envelope of the 46 runs in this study. With more runs in the design space — for example, more depths between 9 and 11, or a 10-layer MLP variant — the frontier would only ever move down or stay the same. The qualitative shape (steep below 16 MB, flat above) is determined by the precision step from INT6 to INT8, which is a property of the quantizer family, not of how many runs we did.
+
+**Q: Are these results specific to FineWeb? Would they transfer to other domains?**
+A: The quantization findings are about the *weight distribution* after training on this much data with this recipe; they should transfer reasonably to other natural-language corpora at similar scale, since trained weight distributions tend to look similar. The architecture findings (Muon, partial RoPE) are recipe-level claims that I'd expect to hold but can't confirm without rerunning. The challenge protocol fixes FineWeb specifically so that submissions are comparable, so I treat cross-domain transfer as out of scope for this study.
+
+---
+
 ### Pacing notes
 
 - **Total: ~8 min** at 135 wpm.
