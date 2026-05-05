@@ -347,19 +347,6 @@ def fig_pareto():
             on_frontier.append(False)
     pts["frontier"] = on_frontier
 
-    # Short, readable labels for frontier points only.
-    short_label = {
-        "o4_rp128_20k":                       "RandProj 9L",
-        "o4_bd4_20k":                         "BlockDiag g=4",
-        "o4_rp128_12L_20k":                   "RandProj 12L",
-        "o1_int6_20k":                        "INT6 9L",
-        "o4_lr128_20k":                       "LowRank r=128",
-        "o2_none_20k":                        "No PE 9L",
-        "o1_int8_20k":                        "INT8 9L",
-        "o2_part_20k":                        "Partial RoPE 9L\n(in-budget winner)",
-        "stacked_int8_safe_11L_mlp2_20k":     "INT8 11L\n(over-budget winner)",
-    }
-
     group_colors = {
         "O1_quant":       "#1f78b4",
         "O2_posenc":      "#d62728",
@@ -368,7 +355,6 @@ def fig_pareto():
         "O5_stacked":     "#6a3d9a",
         "O8_qkgain":      "#ff7f0e",
         "O9_attn":        "#e7298a",
-        "O10_hpsweep":    "#7f7f7f",
     }
     group_labels = {
         "O1_quant":       "O1 Quantization",
@@ -378,35 +364,54 @@ def fig_pareto():
         "O5_stacked":     "O5 Stacked",
         "O8_qkgain":      "O7 QK-gain",
         "O9_attn":        "O6 MQA",
-        "O10_hpsweep":    "O8 LR/warmup",
     }
 
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    fig, ax = plt.subplots(figsize=(12, 6.8))
+
     for group, sub in pts.groupby("group"):
         ax.scatter(sub["total_submission_mb"], sub["final_quant_bpb"],
-                   s=90, color=group_colors.get(group, "#444"),
+                   s=95, color=group_colors.get(group, "#444"),
                    alpha=0.80, edgecolor="black", linewidth=0.7,
                    label=group_labels.get(group, group), zorder=3)
 
     # Frontier line
     front = pts[pts["frontier"]].sort_values("total_submission_mb")
     ax.plot(front["total_submission_mb"], front["final_quant_bpb"],
-            color="black", lw=1.6, ls="-", marker="o", markersize=12,
+            color="black", lw=1.6, ls="-", marker="o", markersize=13,
             markerfacecolor="none", markeredgewidth=2.0,
             label="Pareto frontier", zorder=5)
 
-    # Label frontier points — alternate vertical offset to avoid collisions on the right cluster.
-    offsets = [(8, 8), (8, -14), (8, 8), (8, -14), (8, 8), (8, -14), (-95, -22), (8, 16), (8, -28)]
-    for (_, row), off in zip(front.iterrows(), offsets):
+    # Only annotate four critical frontier points; intermediate ones are visible from the line.
+    KEY_LABELS = {
+        "o4_rp128_20k":
+            ("Smallest:\nRandProj 9L", (16, 14), "left"),
+        "o1_int6_20k":
+            ("Elbow:\nINT6 9L", (16, -22), "left"),
+        "o2_part_20k":
+            ("In-budget winner:\nPartial RoPE 9L\n(1.215 bpb, 15.87 MB)", (-22, 55), "right"),
+        "stacked_int8_safe_11L_mlp2_20k":
+            ("Over-budget winner:\nINT8 11L\n(1.194 bpb, 19.30 MB)", (-22, 55), "right"),
+    }
+    for _, row in front.iterrows():
         rid = row["run_id"]
-        label = short_label.get(rid, rid)
+        if rid not in KEY_LABELS:
+            continue
+        label, off, ha = KEY_LABELS[rid]
+        is_winner = "winner" in label.lower()
         ax.annotate(
             label,
             xy=(row["total_submission_mb"], row["final_quant_bpb"]),
             xytext=off, textcoords="offset points",
-            fontsize=10, color="black",
-            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", lw=0.5, alpha=0.85),
-            arrowprops=dict(arrowstyle="-", color="black", lw=0.6) if abs(off[1]) > 12 else None,
+            fontsize=10.5 if is_winner else 10,
+            color="black", ha=ha, va="center",
+            fontweight="bold" if is_winner else "normal",
+            bbox=dict(boxstyle="round,pad=0.32",
+                      fc="#fff8d6" if is_winner else "white",
+                      ec="black",
+                      lw=1.0 if is_winner else 0.5,
+                      alpha=0.95),
+            arrowprops=dict(arrowstyle="-", color="black", lw=0.7),
+            zorder=10,
         )
 
     # 16MB reference line + label
@@ -415,11 +420,18 @@ def fig_pareto():
     ax.axhline(BASELINE, color="black", ls="--", lw=1.2, alpha=0.85,
                label=f"Reference bpb ({BASELINE})")
 
+    # Extra right margin so the over-budget winner annotation is comfortable.
+    x_min, x_max = pts["total_submission_mb"].min(), pts["total_submission_mb"].max()
+    ax.set_xlim(x_min - 0.6, x_max + 1.4)
+
     ax.set_xlabel("Total submission size (MB, weights + code, post-zlib)")
     ax.set_ylabel("Final bpb (post-quant zlib roundtrip)")
     ax.set_title("Pareto frontier: size vs. quality across all 20k-step runs")
     ax.grid(True, alpha=0.25, ls="-", lw=0.5)
-    ax.legend(fontsize=10, loc="upper right", ncol=2, framealpha=0.95)
+    # Push the legend below the plot so it never overlaps the scatter.
+    ax.legend(fontsize=10, loc="upper center",
+              bbox_to_anchor=(0.5, -0.13), ncol=5,
+              frameon=True, framealpha=0.95)
     fig.tight_layout()
     save(fig, "pareto_frontier")
     plt.close(fig)
@@ -468,9 +480,16 @@ def write_results_table():
 
     rows = []
     for _, r in df.iterrows():
+        # Trim redundant suffixes — every reportable run is _20k by filter.
+        run = r["run_id"]
+        if run.endswith("_20k"):
+            run = run[:-4]
+        # Drop the leading axis tag (o1_, o2_, …) since the Group column already encodes it.
+        if len(run) > 3 and run[0] == "o" and run[1].isdigit() and run[2] == "_":
+            run = run[3:]
         rows.append({
             "group":  r["group"] or "",
-            "run":    r["run_id"].replace("_", r"\_"),
+            "run":    run.replace("_", r"\_"),
             "train":  f"{r['best_train_bpb']:.4f}" if not pd.isna(r["best_train_bpb"]) else "—",
             "final":  f"{r['final_quant_bpb']:.4f}",
             "size":   f"{r['total_submission_mb']:.2f}",

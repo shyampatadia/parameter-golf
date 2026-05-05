@@ -14,6 +14,10 @@
 \usepackage{xcolor}
 \usepackage{caption}
 \usepackage{subcaption}
+\usepackage{seqsplit}     % allows long \texttt{} run names to wrap on underscores
+% Allow \texttt{} run names with underscores to break across lines.
+\renewcommand{\_}{\discretionary{\char`\_}{}{\char`\_}}
+\sloppy
 
 \graphicspath{{figures/}}
 
@@ -458,11 +462,11 @@ informative are labelled.
 The frontier exhibits a sharp elbow at $\sim$15.9~MB: below this size,
 each MB saved costs roughly 0.02~bpb (steep tradeoff). At and above
 this size, the marginal cost flattens substantially -- the in-budget
-winner (\texttt{o2\_part\_20k}) and the over-budget winner
-(\texttt{stacked\_int8\_safe\_11L\_mlp2\_20k}) sit on the frontier
-0.020~bpb apart, separated by 3.3~MB. The MQA + 12L variant
-sits very close to the frontier at 19.6~MB / 1.198~bpb but is
-dominated by \texttt{stacked\_int8\_safe} on both axes.
+winner (partial RoPE, 9 layers, INT8) and the over-budget winner
+(11-layer INT8 with MLP expansion 2) sit on the frontier 0.020~bpb
+apart, separated by 3.3~MB. The MQA + 12L variant sits very close to
+the frontier at 19.6~MB / 1.198~bpb but is strictly dominated by the
+11-layer INT8 configuration on both axes.
 
 The 16~MB reference (red dotted line) crosses the frontier between
 two clusters of points. Within the constraint, the partial-RoPE 9L
@@ -484,14 +488,9 @@ central quantitative finding of this paper.}
 \label{fig:pareto}
 \end{figure*}
 
-% ──────────────────────────────────────────────────────────────────────
-\section{Aggregated Results}
-\label{sec:results}
-% ──────────────────────────────────────────────────────────────────────
-
-Table~\ref{tab:results} aggregates every 20{,}000-step run, sorted
-within group by post-quantization final bpb. \textsc{Train} is the
-in-memory bf16 loss; \textsc{Final} is the post-roundtrip loss;
+Table~\ref{tab:results} backs the figure with the per-run numbers
+sorted within group by post-quantization final bpb. \textsc{Train} is
+the in-memory bf16 loss; \textsc{Final} is the post-roundtrip loss;
 \textsc{Size} is the total artifact (weights + training code,
 post-zlib); $\Delta$ is the gap to the 1.2244 reference; the last
 column flags whether the artifact fits the 16~MB reference.
@@ -504,7 +503,8 @@ bpb. ``Size'' is total submission size (weights + training code,
 post-zlib). $\Delta$ is the difference vs.\ the 1.2244 reference; negative is
 better.}
 \label{tab:results}
-\scriptsize
+\small
+\setlength{\tabcolsep}{5pt}
 \input{tables/results_full.tex}
 \end{table*}
 
