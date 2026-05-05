@@ -85,48 +85,54 @@ Why this is interesting:
 % --------------------------------------------------------------- 3
 \begin{frame}{What does ``score'' mean? -- bits per byte}
 \begin{columns}[T,onlytextwidth]
-\column{0.55\textwidth}
-\textbf{bpb} = how many \emph{bits} the model spends to \emph{guess each byte} of unseen text.\\[0.5em]
+\column{0.50\textwidth}
+\small
+\textbf{bpb} = bits the model spends to \emph{guess each byte} of unseen text.
+Same idea as a compression ratio.
 
-It's the same as a compression ratio: a good model spends fewer bits on
-correct guesses; a bad model wastes bits on wrong ones.
+\vspace{0.5em}
+\textbf{How it's calculated:}
+\begin{enumerate}\setlength{\itemsep}{1pt}
+  \item Model assigns probability $p$ to the next token.
+  \item Bits spent on that token $=$ \hil{$-\log_2 p$}.
+  \item Average over held-out tokens, normalize per byte.
+\end{enumerate}
 
-\vspace{0.7em}
-\textbf{The scale:}
-\begin{itemize}\setlength{\itemsep}{2pt}
-  \item \bad{8.0\bpb} -- random guessing (no model)
-  \item \warn{$\sim$4.5\bpb} -- letter frequency only
-  \item \hil{1.2244\bpb} -- our reference baseline
-  \item \good{$\sim$1.0\bpb} -- frontier large LMs (GPT-4 class)
-  \item \textbf{0\bpb} -- a perfect oracle
-\end{itemize}
+\vspace{0.5em}
+{\footnotesize \textbf{Anchors for $-\log_2 p$:} \\
+\hspace*{0.5em}$p{=}1.0 \to $ \good{0 bits} (perfect guess) \\
+\hspace*{0.5em}$p{=}0.5 \to $ 1 bit \\
+\hspace*{0.5em}$p{=}0.01 \to $ \bad{6.6 bits} (badly wrong)}
 
-\vspace{0.6em}
-\textcolor{accent}{\textbf{Lower is better.}} \\
-Every 0.01\bpb is a real, measurable quality difference.
+\vspace{0.5em}
+\textcolor{accent}{\textbf{Lower is better.}} Every 0.01\bpb is measurable.
 
-\column{0.45\textwidth}
+\column{0.50\textwidth}
 \centering
-\begin{tikzpicture}[scale=0.85, every node/.style={font=\scriptsize}]
-\fill[primary!10] (0,0) rectangle (0.6, 8);
-\foreach \y/\lab in {0/0, 2/2, 4/4, 6/6, 8/8} {
-  \draw (0,\y) -- (0.6,\y);
-  \node[left] at (0,\y) {\lab};
-}
-\node[rotate=90, above] at (-1.2, 4) {\textbf{bpb} (lower = better)};
+\textbf{\small Worked example}
+\vspace{0.2em}
 
-\node[right, accent] at (0.7, 8.0)  {\bad{8.0} -- random};
-\node[right, warn]   at (0.7, 4.5)  {\warn{4.5} -- letter freq.};
-\node[right, primary, font=\scriptsize\bfseries] at (0.7, 1.2244) {\hil{1.22} -- baseline};
-\node[right, ok]     at (0.7, 1.0)  {\good{1.0} -- GPT-4 class};
-\node[right]         at (0.7, 0.0)  {\textbf{0} -- oracle};
-
-\fill[accent]  (0.3, 8.0)    circle (1.5pt);
-\fill[warn]    (0.3, 4.5)    circle (1.5pt);
-\fill[primary] (0.3, 1.2244) circle (2.5pt);
-\fill[ok]      (0.3, 1.0)    circle (1.5pt);
-\fill[ink]     (0.3, 0.0)    circle (1.5pt);
+\begin{tikzpicture}[every node/.style={font=\scriptsize, align=left}]
+\node[draw=primary, very thick, rounded corners, fill=soft,
+      text width=5.5cm, inner sep=6pt] (ex) {%
+\textbf{Prefix:} \texttt{"The quick brown\_\_\_"} \\[0.3em]
+\textbf{Model's top predictions:}\\
+\hspace*{0.5em}\texttt{fox}\hspace{0.5em}$p{=}0.62$ \\
+\hspace*{0.5em}\texttt{dog}\hspace{0.5em}$p{=}0.08$ \\
+\hspace*{0.5em}\texttt{cat}\hspace{0.5em}$p{=}0.05$ \\[0.3em]
+\textbf{If the actual next token is \texttt{fox}:} \\
+\hspace*{0.5em}bits spent $=-\log_2(0.62) \approx$ \good{0.69} \\[0.3em]
+\textbf{If it were \texttt{cat}:} \\
+\hspace*{0.5em}bits spent $=-\log_2(0.05) \approx$ \bad{4.32} \\[0.3em]
+Average across thousands of held-out tokens $\rightarrow$ \hil{bpb}.};
 \end{tikzpicture}
+
+\vspace{0.4em}
+{\scriptsize\textbf{Reference scale:} \,
+\bad{8.0} random \,$\cdot$\,
+\hil{1.22} baseline \,$\cdot$\,
+\good{1.0} GPT-4 \,$\cdot$\,
+0 oracle}
 \end{columns}
 \end{frame}
 

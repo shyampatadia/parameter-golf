@@ -23,13 +23,15 @@ The number we're trying to beat — the published baseline for this challenge �
 
 ---
 
-## Slide 3 — bpb intuition  *(~50 s)*
+## Slide 3 — bpb intuition  *(~60 s)*
 
-So bpb is bits-per-byte. It's how many bits the model spends to *guess each byte* of unseen text. It's the same idea as a compression ratio — a good model spends fewer bits on correct guesses; a bad model wastes bits on wrong ones.
+So bpb is bits-per-byte — how many bits the model spends to *guess each byte* of unseen text. It's the same idea as a compression ratio.
 
-The scale on the right anchors this. If you guess randomly over all 256 possible byte values, that's 8 bpb — you're using all 8 bits and getting no benefit from a model. If you only know which letters are common in English, you get to about 4.5. The challenge baseline is at 1.22. Frontier models like GPT-4 are around 1.0. A perfect oracle is at zero.
+Here's how it's calculated. For each next token in the held-out text, the model gives a probability `p`. The bits "spent" on that token are `minus log base 2 of p`. So a perfect guess at probability 1 costs zero bits. Probability one-half costs one bit. Probability one in a hundred costs about 6.6 bits. We average those numbers across all held-out tokens and normalize per byte.
 
-So lower is better, and every hundredth of a bpb is a measurable difference in quality.
+The worked example on the right makes it concrete. Suppose we feed the model the prefix "The quick brown" and it returns its top predictions: fox at probability 0.62, dog at 0.08, cat at 0.05. If the actual next token is "fox", the model spent about 0.69 bits — a confident, correct guess is cheap. If the actual next token had been "cat" instead, that's 4.3 bits — much more expensive, because the model wasn't expecting it. Average those costs across thousands of held-out tokens and you get bpb.
+
+For reference: random guessing is 8 bpb. The challenge baseline is 1.22. GPT-4-class models are around 1.0. A perfect oracle is zero. So lower is better, and every hundredth of a bpb is a measurable difference in quality.
 
 ---
 
